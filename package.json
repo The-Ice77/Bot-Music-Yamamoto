@@ -1,0 +1,27 @@
+{
+  "name": "discord-music-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --disable-warning=ExperimentalWarning --import tsx src/index.ts",
+    "build": "tsc",
+    "start": "node --disable-warning=ExperimentalWarning dist/index.js",
+    "deploy-commands": "node --disable-warning=ExperimentalWarning --import tsx src/deployCommands.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --disable-warning=ExperimentalWarning --import tsx --test \"tests/**/*.test.ts\""
+  },
+  "dependencies": {
+    "discord.js": "^14.28.1",
+    "dotenv": "^18.0.10",
+    "lavalink-client": "^2.11.2",
+    "pino": "^10.4.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "pino-pretty": "^13.2.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
