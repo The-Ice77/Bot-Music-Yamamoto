@@ -958,3 +958,171 @@ test('shutdownGracefully cancels pending timers without destroying active Lavali
   assert.notEqual(gateway.getPlayer('g1'), null);
   db.close();
 });
+
+test('concurrent play calls in same guild serialize createPlayer and strictly enforce maxQueueSize', async () => {
+  const { db, gateway, service } = createHarness({ maxQueueSize: 5 });
+
+  let createCount = 0;
+  const originalCreatePlayer = gateway.createPlayer.bind(gateway);
+  gateway.createPlayer = async (options) => {
+    createCount += 1;
+    await delay(25);
+    return originalCreatePlayer(options);
+  };
+
+  let batch = 0;
+  gateway.searchHandler = () => {
+    batch += 1;
+    return {
+      loadType: 'playlist',
+      tracks: Array.from({ length: 4 }, (_, idx) => makeTrack(`b${batch}-${idx}`)),
+      playlist: { name: `Playlist ${batch}`, title: `Playlist ${batch}` },
+      exception: null,
+    };
+  };
+
+  const [first, second] = await Promise.all([
+    service.play({
+      guildId: 'g-race',
+      voiceChannelId: 'vc1',
+      textChannelId: 'tc1',
+      query: 'https://www.youtube.com/playlist?list=PL1',
+      requester: { id: 'u1' },
+    }),
+    service.play({
+      guildId: 'g-race',
+      voiceChannelId: 'vc1',
+      textChannelId: 'tc1',
+      query: 'https://www.youtube.com/playlist?list=PL2',
+      requester: { id: 'u2' },
+    }),
+  ]);
+
+  assert.equal(createCount, 1);
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  if (first.ok && second.ok) {
+    assert.equal(first.addedCount, 4);
+    assert.equal(first.truncatedCount, 0);
+    assert.equal(second.addedCount, 2);
+    assert.equal(second.truncatedCount, 2);
+  }
+
+  const player = gateway.getPlayer('g-race')!;
+  assert.equal(player.tracks.length, 5);
+
+  // Two concurrent single-track requests when queue is already full must both reject cleanly
+  gateway.searchHandler = () => ({
+    loadType: 'track',
+    tracks: [makeTrack('overflow')],
+    playlist: null,
+    exception: null,
+  });
+  const [over1, over2] = await Promise.all([
+    service.play({
+      guildId: 'g-race',
+      voiceChannelId: 'vc1',
+      textChannelId: 'tc1',
+      query: 'https://www.youtube.com/watch?v=overflow1',
+      requester: { id: 'u1' },
+    }),
+    service.play({
+      guildId: 'g-race',
+      voiceChannelId: 'vc1',
+      textChannelId: 'tc1',
+      query: 'https://www.youtube.com/watch?v=overflow2',
+      requester: { id: 'u2' },
+    }),
+  ]);
+  assert.equal(over1.ok, false);
+  assert.equal(over2.ok, false);
+  assert.equal(player.tracks.length, 5);
+
+  await service.shutdownGracefully();
+  db.close();
+});
+
+test('shutdownGracefully immediately settles mid-stagger rejoin247Guilds promise', async () => {
+  const { db, settingsRepo, gateway, service } = createHarness({ rejoinStaggerMs: 500 });
+  settingsRepo.update('g-247-a', { alwaysOn247: true, voiceChannelId247: 'vc-a', textChannelId247: 'tc-a' });
+  settingsRepo.update('g-247-b', { alwaysOn247: true, voiceChannelId247: 'vc-b', textChannelId247: 'tc-b' });
+  settingsRepo.update('g-247-c', { alwaysOn247: true, voiceChannelId247: 'vc-c', textChannelId247: 'tc-c' });
+
+  const rejoinPromise = service.rejoin247Guilds();
+  await delay(30);
+  assert.equal(gateway.joinTimestamps.length, 1);
+
+  await service.shutdownGracefully();
+  const outcome = await Promise.race([
+    rejoinPromise.then(() => 'settled' as const),
+    delay(150).then(() => 'timed-out' as const),
+  ]);
+
+  assert.equal(outcome, 'settled');
+  assert.equal(gateway.joinTimestamps.length, 1);
+  db.close();
+});
+
+test('handleNodeResumed cleans stale panel and schedules auto-leave for idle non-24/7 player with currentTrack === null', async () => {
+  const { db, settingsRepo, sessionStore, gateway, messenger, service } = createHarness();
+
+  settingsRepo.update('g-idle-off', {
+    alwaysOn247: false,
+    autoLeaveSeconds: 0.03 as unknown as number,
+  });
+  let disabledIdleOffPanel = false;
+  messenger.messageStore.set('panel-idle-off', {
+    components: [buildControlButtons({ paused: false, repeatMode: 'off' })],
+    edit: async () => {
+      disabledIdleOffPanel = true;
+    },
+  });
+  sessionStore.saveActivePlayer({
+    guildId: 'g-idle-off',
+    voiceChannelId: 'vc-idle-off',
+    textChannelId: 'tc-idle-off',
+    repeatMode: 'off',
+    panelChannelId: 'tc-idle-off',
+    panelMessageId: 'panel-idle-off',
+  });
+
+  // Also ensure an idle 24/7 resumed player disables stale panel but remains connected
+  settingsRepo.update('g-idle-247', {
+    alwaysOn247: true,
+    voiceChannelId247: 'vc-idle-247',
+    textChannelId247: 'tc-idle-247',
+  });
+  let disabledIdle247Panel = false;
+  messenger.messageStore.set('panel-idle-247', {
+    components: [buildControlButtons({ paused: false, repeatMode: 'off' })],
+    edit: async () => {
+      disabledIdle247Panel = true;
+    },
+  });
+  sessionStore.saveActivePlayer({
+    guildId: 'g-idle-247',
+    voiceChannelId: 'vc-idle-247',
+    textChannelId: 'tc-idle-247',
+    repeatMode: 'off',
+    panelChannelId: 'tc-idle-247',
+    panelMessageId: 'panel-idle-247',
+  });
+
+  await service.handleNodeResumed('main', 'sess-resumed-idle', [
+    { guildId: 'g-idle-off', voiceChannelId: 'vc-idle-off', volume: 80, paused: false, currentTrack: null },
+    { guildId: 'g-idle-247', voiceChannelId: 'vc-idle-247', volume: 80, paused: false, currentTrack: null },
+  ]);
+
+  assert.equal(disabledIdleOffPanel, true);
+  assert.equal(disabledIdle247Panel, true);
+  assert.equal(sessionStore.getActivePlayer('g-idle-off')?.panelMessageId, null);
+  assert.equal(sessionStore.getActivePlayer('g-idle-247')?.panelMessageId, null);
+
+  await delay(60);
+  assert.equal(gateway.getPlayer('g-idle-off'), null);
+  assert.ok(gateway.destroyCalls.some((c) => c.guildId === 'g-idle-off' && c.reason === 'autoLeave'));
+  assert.notEqual(gateway.getPlayer('g-idle-247'), null);
+
+  await service.shutdownGracefully();
+  db.close();
+});

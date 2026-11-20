@@ -294,6 +294,11 @@ export interface MusicServiceDeps {
   rejoinStaggerMs?: number;
 }
 
+interface PendingStagger {
+  handle: NodeJS.Timeout;
+  resolve: () => void;
+}
+
 function extractRequesterInfo(requester: unknown): {
   requesterId: string | null;
   requesterTag: string | null;
@@ -369,7 +374,8 @@ export class MusicService {
   private readonly disconnectingGuilds = new Set<string>();
   private readonly emptyGuildChannels = new Set<string>();
   private readonly pausedByEmptyChannel = new Set<string>();
-  private readonly staggerHandles = new Set<NodeJS.Timeout>();
+  private readonly guildLocks = new Map<string, Promise<void>>();
+  private readonly pendingStaggers = new Set<PendingStagger>();
   private shuttingDown = false;
 
   constructor(deps: MusicServiceDeps) {
@@ -465,77 +471,90 @@ export class MusicService {
     const isPlaylist = searchResult.loadType === 'playlist';
     const candidates = isPlaylist ? searchResult.tracks : [searchResult.tracks[0]];
 
-    const existingAfterSearch = this.gateway.getPlayer(input.guildId);
-    const currentQueueLength = existingAfterSearch ? existingAfterSearch.queue.tracks.length : 0;
-    const availableSlots = Math.max(0, this.maxQueueSize - currentQueueLength);
-    if (availableSlots === 0) {
+    return this.withGuildLock(input.guildId, async () => {
+      const existingBeforeEnsure = this.gateway.getPlayer(input.guildId);
+      const queueLengthBeforeEnsure = existingBeforeEnsure
+        ? existingBeforeEnsure.queue.tracks.length
+        : 0;
+      if (queueLengthBeforeEnsure >= this.maxQueueSize) {
+        return {
+          ok: false,
+          reason: 'QUEUE_FULL',
+          message: `A fila atingiu o limite máximo de **${this.maxQueueSize}** músicas. Remova músicas ou limpe a fila antes de adicionar novas.`,
+        };
+      }
+
+      this.timers.cancel(input.guildId);
+      this.botInitiatedDisconnects.delete(input.guildId);
+      this.pausedByEmptyChannel.delete(input.guildId);
+
+      const settings = this.settingsRepo.getOrDefault(input.guildId);
+      const { player } = await this.ensureVoicePlayer(
+        input.guildId,
+        input.voiceChannelId,
+        input.textChannelId,
+        settings.defaultVolume,
+      );
+
+      // Re-check queue capacity immediately before insertion after async voice connect/move.
+      const availableSlots = Math.max(0, this.maxQueueSize - player.queue.tracks.length);
+      if (availableSlots === 0) {
+        return {
+          ok: false,
+          reason: 'QUEUE_FULL',
+          message: `A fila atingiu o limite máximo de **${this.maxQueueSize}** músicas. Remova músicas ou limpe a fila antes de adicionar novas.`,
+        };
+      }
+
+      const tracksToAdd = candidates.slice(0, availableSlots);
+      const addedCount = tracksToAdd.length;
+      const truncatedCount = candidates.length - addedCount;
+
+      if (settings.alwaysOn247) {
+        this.settingsRepo.update(input.guildId, {
+          voiceChannelId247: input.voiceChannelId,
+          textChannelId247: input.textChannelId,
+        });
+      }
+
+      await player.queue.add(tracksToAdd);
+
+      const startedImmediately = !player.playing && !player.queue.current;
+      if (startedImmediately) {
+        await player.play();
+      }
+
+      this.persistActiveSession(input.guildId, player, input.voiceChannelId, input.textChannelId);
+
+      const firstTrack = tracksToAdd[0];
+      const playlistName =
+        isPlaylist ? (searchResult.playlist?.title ?? searchResult.playlist?.name ?? 'Playlist') : null;
+
+      let message: string;
+      if (isPlaylist) {
+        message =
+          truncatedCount > 0
+            ? `Playlist **${playlistName}** adicionada com **${addedCount}** músicas (${truncatedCount} ignoradas pelo limite de ${this.maxQueueSize} da fila).`
+            : `Playlist **${playlistName}** adicionada com **${addedCount}** músicas.`;
+      } else {
+        const author = firstTrack.info.author ?? 'Desconhecido';
+        message = startedImmediately
+          ? `Tocando agora: **${firstTrack.info.title}** — ${author}.`
+          : `Adicionada à fila: **${firstTrack.info.title}** — ${author}.`;
+      }
+
       return {
-        ok: false,
-        reason: 'QUEUE_FULL',
-        message: `A fila atingiu o limite máximo de **${this.maxQueueSize}** músicas. Remova músicas ou limpe a fila antes de adicionar novas.`,
+        ok: true,
+        isPlaylist,
+        playlistName,
+        tracks: tracksToAdd,
+        firstTrack,
+        addedCount,
+        truncatedCount,
+        startedImmediately,
+        message,
       };
-    }
-
-    const tracksToAdd = candidates.slice(0, availableSlots);
-    const addedCount = tracksToAdd.length;
-    const truncatedCount = candidates.length - addedCount;
-
-    this.timers.cancel(input.guildId);
-    this.botInitiatedDisconnects.delete(input.guildId);
-    this.pausedByEmptyChannel.delete(input.guildId);
-
-    const settings = this.settingsRepo.getOrDefault(input.guildId);
-    const { player } = await this.ensureVoicePlayer(
-      input.guildId,
-      input.voiceChannelId,
-      input.textChannelId,
-      settings.defaultVolume,
-    );
-
-    if (settings.alwaysOn247) {
-      this.settingsRepo.update(input.guildId, {
-        voiceChannelId247: input.voiceChannelId,
-        textChannelId247: input.textChannelId,
-      });
-    }
-
-    await player.queue.add(tracksToAdd);
-
-    const startedImmediately = !player.playing && !player.queue.current;
-    if (startedImmediately) {
-      await player.play();
-    }
-
-    this.persistActiveSession(input.guildId, player, input.voiceChannelId, input.textChannelId);
-
-    const firstTrack = tracksToAdd[0];
-    const playlistName =
-      isPlaylist ? (searchResult.playlist?.title ?? searchResult.playlist?.name ?? 'Playlist') : null;
-
-    let message: string;
-    if (isPlaylist) {
-      message =
-        truncatedCount > 0
-          ? `Playlist **${playlistName}** adicionada com **${addedCount}** músicas (${truncatedCount} ignoradas pelo limite de ${this.maxQueueSize} da fila).`
-          : `Playlist **${playlistName}** adicionada com **${addedCount}** músicas.`;
-    } else {
-      const author = firstTrack.info.author ?? 'Desconhecido';
-      message = startedImmediately
-        ? `Tocando agora: **${firstTrack.info.title}** — ${author}.`
-        : `Adicionada à fila: **${firstTrack.info.title}** — ${author}.`;
-    }
-
-    return {
-      ok: true,
-      isPlaylist,
-      playlistName,
-      tracks: tracksToAdd,
-      firstTrack,
-      addedCount,
-      truncatedCount,
-      startedImmediately,
-      message,
-    };
+    });
   }
 
   /**
@@ -936,22 +955,24 @@ export class MusicService {
       };
     }
 
-    const settings = this.settingsRepo.getOrDefault(guildId);
-    const { player, created } = await this.ensureVoicePlayer(
-      guildId,
-      voiceChannelId,
-      textChannelId,
-      settings.defaultVolume,
-    );
-    this.persistActiveSession(
-      guildId,
-      player,
-      voiceChannelId,
-      textChannelId,
-      created ? null : undefined,
-    );
+    return this.withGuildLock(guildId, async () => {
+      const settings = this.settingsRepo.getOrDefault(guildId);
+      const { player, created } = await this.ensureVoicePlayer(
+        guildId,
+        voiceChannelId,
+        textChannelId,
+        settings.defaultVolume,
+      );
+      this.persistActiveSession(
+        guildId,
+        player,
+        voiceChannelId,
+        textChannelId,
+        created ? null : undefined,
+      );
 
-    return { ok: true, alreadyConnected: !created };
+      return { ok: true, alreadyConnected: !created };
+    });
   }
 
   /**
@@ -1214,6 +1235,32 @@ export class MusicService {
       resumedGuildIds.add(resumed.guildId);
       this.botInitiatedDisconnects.delete(resumed.guildId);
 
+      const isIdle = !resumed.currentTrack && !player.playing && !player.queue.current;
+      if (isIdle) {
+        if (saved?.panelChannelId && saved.panelMessageId) {
+          this.panelTracker.setPanel(resumed.guildId, {
+            channelId: saved.panelChannelId,
+            messageId: saved.panelMessageId,
+          });
+          await this.disableActivePanel(resumed.guildId);
+        }
+
+        if (saved || textChannelId) {
+          this.persistActiveSession(
+            resumed.guildId,
+            player,
+            voiceChannelId,
+            textChannelId ?? undefined,
+            null,
+          );
+        }
+
+        if (!settings.alwaysOn247) {
+          this.scheduleAutoLeave(resumed.guildId, settings.autoLeaveSeconds);
+        }
+        continue;
+      }
+
       if (saved?.panelChannelId && saved.panelMessageId) {
         this.panelTracker.setPanel(resumed.guildId, {
           channelId: saved.panelChannelId,
@@ -1347,10 +1394,10 @@ export class MusicService {
   async shutdownGracefully(): Promise<void> {
     this.shuttingDown = true;
     this.timers.clearAll();
-    for (const handle of this.staggerHandles) {
-      clearTimeout(handle);
+    for (const pending of Array.from(this.pendingStaggers)) {
+      pending.resolve();
     }
-    this.staggerHandles.clear();
+    this.pendingStaggers.clear();
     this.logger.info('MusicService encerrado graciosamente preservando players ativos no Lavalink');
   }
 
@@ -1592,13 +1639,42 @@ export class MusicService {
     return { player: existing, created: false };
   }
 
+  private async withGuildLock<T>(guildId: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.guildLocks.get(guildId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const chained = previous.then(() => current);
+    this.guildLocks.set(guildId, chained);
+
+    await previous;
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.guildLocks.get(guildId) === chained) {
+        this.guildLocks.delete(guildId);
+      }
+    }
+  }
+
   private sleepStagger(ms: number): Promise<void> {
+    if (this.shuttingDown) {
+      return Promise.resolve();
+    }
+
     return new Promise((resolve) => {
-      const handle = setTimeout(() => {
-        this.staggerHandles.delete(handle);
-        resolve();
-      }, ms);
-      this.staggerHandles.add(handle);
+      const entry: PendingStagger = {
+        handle: undefined as unknown as NodeJS.Timeout,
+        resolve: () => {
+          clearTimeout(entry.handle);
+          this.pendingStaggers.delete(entry);
+          resolve();
+        },
+      };
+      entry.handle = setTimeout(entry.resolve, ms);
+      this.pendingStaggers.add(entry);
     });
   }
 }
