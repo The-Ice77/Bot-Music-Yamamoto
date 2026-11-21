@@ -11,7 +11,7 @@ services:
       - YOUTUBE_OAUTH_REFRESH_TOKEN=${YOUTUBE_OAUTH_REFRESH_TOKEN:-}
     volumes:
       - ./lavalink/application.yml:/opt/Lavalink/application.yml:ro
-      - lavalink_plugins:/opt/Lavalink/plugins
+      - ./lavalink/plugins:/opt/Lavalink/plugins
     healthcheck:
       test: ["CMD-SHELL", 'wget --header="Authorization: $$LAVALINK_SERVER_PASSWORD" -q -O /dev/null http://127.0.0.1:2333/version || exit 1']
       interval: 15s

@@ -56,7 +56,7 @@ test('docker-compose.yml defines secure internal Lavalink and healthy bot depend
   assert.ok(compose.includes('-Xmx1G'));
   assert.ok(compose.includes('service_healthy'));
   assert.ok(compose.includes('./data:/app/data'));
-  assert.ok(compose.includes('lavalink_plugins:/opt/Lavalink/plugins'));
+  assert.ok(compose.includes('./lavalink/plugins:/opt/Lavalink/plugins'));
   assert.ok(compose.includes('./lavalink/application.yml:/opt/Lavalink/application.yml:ro'));
   assert.match(compose, /restart:\s*unless-stopped/);
 
