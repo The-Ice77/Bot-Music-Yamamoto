@@ -124,15 +124,20 @@ Antes de usar os comandos no Discord, publique-os com o script dedicado:
 
 1. Instale e inicie o **Docker Desktop** no Windows.
 2. No `.env`, garanta `LAVALINK_HOST=lavalink` e uma senha forte em `LAVALINK_PASSWORD`.
-3. Suba o Lavalink e o bot com:
+3. Crie a pasta `./data` antes de subir os containers (no Docker Engine em Linux ou WSL2 nativo, garanta permissão de escrita ao UID `1000`, que corresponde ao usuário `node` dentro do container para o SQLite gravar em `/app/data/bot.sqlite`):
+   ```powershell
+   New-Item -ItemType Directory -Force -Path data | Out-Null
+   ```
+   *(Se estiver rodando em um shell Linux/WSL2: `mkdir -p data && sudo chown -R 1000:1000 data`.)*
+4. Suba o Lavalink e o bot com:
    ```powershell
    docker compose up -d --build
    ```
-4. Acompanhe os logs:
+5. Acompanhe os logs:
    ```powershell
    docker compose logs -f
    ```
-5. Caso ainda não tenha publicado os comandos Slash, execute dentro do container ou localmente com Node.js 24:
+6. Caso ainda não tenha publicado os comandos Slash, execute dentro do container ou localmente com Node.js 24:
    ```powershell
    docker compose run --rm --no-deps bot node --disable-warning=ExperimentalWarning dist/deployCommands.js
    ```
@@ -191,6 +196,9 @@ git clone <URL_DO_SEU_REPOSITORIO> bot-musica
 cd bot-musica
 cp .env.example .env
 nano .env   # preencha DISCORD_TOKEN, DISCORD_CLIENT_ID, LAVALINK_PASSWORD, Spotify etc.
+
+# Criar ./data com dono UID 1000 (usuário `node` do container) para evitar EACCES/SQLITE_CANTOPEN no SQLite
+mkdir -p data && sudo chown -R 1000:1000 data
 
 # Subir Lavalink v4.2-alpine + Bot em background
 docker compose up -d --build

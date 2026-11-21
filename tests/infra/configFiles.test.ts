@@ -147,9 +147,11 @@ test('.env.example and pt-BR README.md cover all required operational topics and
   assert.match(readme, /Java 21/i);
   assert.match(readme, /Node(\.js)?\s*24/i);
 
-  // Oracle Cloud Always Free ARM64 deploy, OAuth/poToken, idle reclamation
+  // Oracle Cloud Always Free ARM64 deploy, Linux ./data UID 1000 ownership, OAuth/poToken, idle reclamation
   assert.match(readme, /Oracle Cloud Always Free/i);
   assert.match(readme, /ARM64/i);
+  assert.ok(readme.includes('mkdir -p data && sudo chown -R 1000:1000 data'));
+  assert.match(readme, /UID\s*`?1000`?/i);
   assert.match(readme, /OAuth/i);
   assert.match(readme, /poToken/i);
   assert.match(readme, /ociosidade|idle/i);
