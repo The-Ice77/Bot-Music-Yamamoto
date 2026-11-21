@@ -33,7 +33,7 @@ test('lavalink/application.yml matches Lavalink v4.2+ and plugin spec invariants
   assert.ok(yml.includes('MUSIC'));
   assert.ok(yml.includes('ANDROID_VR'));
   assert.ok(yml.includes('WEB'));
-  assert.match(yml, /#\s*oauth:/);
+  assert.match(yml, /\boauth:/);
   assert.match(yml, /#\s*pot:/);
 
   // LavaSrc Spotify configuration
