@@ -407,6 +407,9 @@ export function createLavalinkManager(deps: CreateLavalinkManagerDeps): Lavalink
           channel = await guild.channels.fetch(voiceChannelId);
         } catch (error) {
           const code = extractDiscordErrorCode(error);
+          if (code === 10004) {
+            return { ok: false, reason: 'GUILD_NOT_FOUND' };
+          }
           if (code === 10003) {
             return { ok: false, reason: 'CHANNEL_NOT_FOUND' };
           }

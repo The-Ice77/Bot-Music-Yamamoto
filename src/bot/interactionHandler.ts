@@ -80,6 +80,28 @@ async function safeReplyEphemeral(
   }
 }
 
+async function finishButtonReply(
+  interaction: ButtonInteraction,
+  content: string,
+  logger: AppLogger,
+  deferredByUs: boolean,
+): Promise<void> {
+  if (deferredByUs && typeof interaction.editReply === 'function') {
+    try {
+      await interaction.editReply({ content });
+      return;
+    } catch (error) {
+      logger.warn(
+        { err: error, guildId: interaction.guildId, userId: interaction.user?.id },
+        'Falha ao editar resposta efêmera adiada do botão',
+      );
+      return;
+    }
+  }
+
+  await safeReplyEphemeral(interaction, content, logger);
+}
+
 async function disableStaleButtonMessage(
   interaction: ButtonInteraction,
   logger: AppLogger,
@@ -158,6 +180,17 @@ async function handlePanelButton(
     return;
   }
 
+  const botVoice = resolveVoiceChannel(guild, guild.members?.me?.voice);
+  if (botVoice.channelId === null && !deps.musicService.getNowPlaying(guildId)) {
+    await safeReplyEphemeral(
+      interaction,
+      '❌ Não há nenhuma reprodução ativa no momento.',
+      deps.logger,
+    );
+    await disableStaleButtonMessage(interaction, deps.logger);
+    return;
+  }
+
   const memberVoice = resolveVoiceChannel(guild, member.voice);
   if (!memberVoice.channelId) {
     await safeReplyEphemeral(
@@ -168,7 +201,6 @@ async function handlePanelButton(
     return;
   }
 
-  const botVoice = resolveVoiceChannel(guild, guild.members?.me?.voice);
   if (botVoice.channelId !== null && botVoice.channelId !== memberVoice.channelId) {
     await safeReplyEphemeral(
       interaction,
@@ -194,7 +226,18 @@ async function handlePanelButton(
     return;
   }
 
+  const isNonUpdateControl =
+    interaction.customId === PANEL_BUTTON_IDS.skip ||
+    interaction.customId === PANEL_BUTTON_IDS.shuffle ||
+    interaction.customId === PANEL_BUTTON_IDS.stop;
+
+  let deferredByUs = false;
   try {
+    if (isNonUpdateControl && typeof interaction.deferReply === 'function') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      deferredByUs = true;
+    }
+
     let result: { ok: boolean; reason?: string; message: string };
     let endedQueue = false;
 
@@ -224,7 +267,7 @@ async function handlePanelButton(
     }
 
     if (!result.ok) {
-      await safeReplyEphemeral(interaction, `❌ ${result.message}`, deps.logger);
+      await finishButtonReply(interaction, `❌ ${result.message}`, deps.logger, deferredByUs);
       if (result.reason === 'NO_PLAYER' || result.reason === 'NO_ACTIVE_TRACK') {
         await disableStaleButtonMessage(interaction, deps.logger);
       }
@@ -257,25 +300,25 @@ async function handlePanelButton(
         return;
       }
 
-      await safeReplyEphemeral(interaction, result.message, deps.logger);
+      await finishButtonReply(interaction, result.message, deps.logger, deferredByUs);
       return;
     }
 
     if (interaction.customId === PANEL_BUTTON_IDS.stop) {
+      await finishButtonReply(interaction, `⏹️ ${result.message}`, deps.logger, deferredByUs);
       await disableStaleButtonMessage(interaction, deps.logger);
-      await safeReplyEphemeral(interaction, `⏹️ ${result.message}`, deps.logger);
       return;
     }
 
     if (interaction.customId === PANEL_BUTTON_IDS.skip) {
+      await finishButtonReply(interaction, `⏭️ ${result.message}`, deps.logger, deferredByUs);
       if (endedQueue) {
         await disableStaleButtonMessage(interaction, deps.logger);
       }
-      await safeReplyEphemeral(interaction, `⏭️ ${result.message}`, deps.logger);
       return;
     }
 
-    await safeReplyEphemeral(interaction, `🔀 ${result.message}`, deps.logger);
+    await finishButtonReply(interaction, `🔀 ${result.message}`, deps.logger, deferredByUs);
   } catch (error) {
     deps.logger.error(
       {
@@ -286,10 +329,11 @@ async function handlePanelButton(
       },
       'Erro inesperado ao processar botão do painel de música',
     );
-    await safeReplyEphemeral(
+    await finishButtonReply(
       interaction,
       'Ocorreu um erro inesperado ao processar este botão. Tente novamente.',
       deps.logger,
+      deferredByUs,
     );
   }
 }

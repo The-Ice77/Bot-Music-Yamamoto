@@ -104,8 +104,11 @@ function makeButtonInteraction(options: {
   memberRoleIds?: string[];
   memberPerms?: bigint[];
   messageEditError?: unknown;
+  callOrder?: string[];
 }) {
   const replies: Array<Record<string, unknown>> = [];
+  const deferReplies: Array<Record<string, unknown>> = [];
+  const editReplies: Array<Record<string, unknown>> = [];
   const followUps: Array<Record<string, unknown>> = [];
   const updates: Array<Record<string, unknown>> = [];
   const messageEdits: Array<Record<string, unknown>> = [];
@@ -149,6 +152,7 @@ function makeButtonInteraction(options: {
     channelId: options.channelId ?? 'tc-1',
     components: [buildControlButtons({ paused: false, repeatMode: 'off' })],
     edit: async (payload: Record<string, unknown>) => {
+      options.callOrder?.push('message.edit');
       if (options.messageEditError) {
         throw options.messageEditError;
       }
@@ -186,21 +190,42 @@ function makeButtonInteraction(options: {
     inGuild: () => Boolean(guildId && guild),
     isChatInputCommand: () => false,
     isButton: () => true,
+    deferReply: async (payload: Record<string, unknown> = {}) => {
+      options.callOrder?.push('deferReply');
+      deferred = true;
+      deferReplies.push(payload);
+    },
+    editReply: async (payload: Record<string, unknown>) => {
+      options.callOrder?.push('editReply');
+      replied = true;
+      editReplies.push(payload);
+    },
     reply: async (payload: Record<string, unknown>) => {
+      options.callOrder?.push('reply');
       replied = true;
       replies.push(payload);
     },
     followUp: async (payload: Record<string, unknown>) => {
+      options.callOrder?.push('followUp');
       replied = true;
       followUps.push(payload);
     },
     update: async (payload: Record<string, unknown>) => {
+      options.callOrder?.push('update');
       replied = true;
       updates.push(payload);
     },
   } as unknown as ButtonInteraction;
 
-  return { interaction, replies, followUps, updates, messageEdits };
+  return {
+    interaction,
+    replies,
+    deferReplies,
+    editReplies,
+    followUps,
+    updates,
+    messageEdits,
+  };
 }
 
 function makeSnapshot(overrides: Partial<NowPlayingSnapshot> = {}): NowPlayingSnapshot {
@@ -426,8 +451,10 @@ test('handleInteraction handles all 5 music:* panel buttons when authorized in t
     settingsRepo,
     logger,
   });
-  assert.equal(skip.replies.length, 1);
-  assert.equal(skip.replies[0].flags, MessageFlags.Ephemeral);
+  assert.equal(skip.deferReplies.length, 1);
+  assert.equal(skip.deferReplies[0].flags, MessageFlags.Ephemeral);
+  assert.equal(skip.editReplies.length, 1);
+  assert.match(String(skip.editReplies[0].content), /Música pulada/i);
 
   const loop = makeButtonInteraction({
     customId: PANEL_BUTTON_IDS.loop,
@@ -453,22 +480,37 @@ test('handleInteraction handles all 5 music:* panel buttons when authorized in t
     settingsRepo,
     logger,
   });
-  assert.equal(shuffle.replies.length, 1);
-  assert.equal(shuffle.replies[0].flags, MessageFlags.Ephemeral);
+  assert.equal(shuffle.deferReplies.length, 1);
+  assert.equal(shuffle.deferReplies[0].flags, MessageFlags.Ephemeral);
+  assert.equal(shuffle.editReplies.length, 1);
+  assert.match(String(shuffle.editReplies[0].content), /Fila embaralhada/i);
+
+  const stopCallOrder: string[] = [];
+  const stopMusicService = makeMusicServiceMock({
+    stop: async (guildId) => {
+      stopCallOrder.push('musicService.stop');
+      calls.push(`stop:${guildId}`);
+      return { ok: true, disconnected: true, message: 'Reprodução parada.' };
+    },
+    getNowPlaying: () => makeSnapshot({ paused, repeatMode }),
+  });
 
   const stop = makeButtonInteraction({
     customId: PANEL_BUTTON_IDS.stop,
     memberVoiceChannel: vc,
     botVoiceChannel: vc,
+    callOrder: stopCallOrder,
   });
   await handleInteraction(stop.interaction as unknown as Interaction, {
-    musicService,
+    musicService: stopMusicService,
     settingsRepo,
     logger,
   });
-  assert.equal(stop.replies.length, 1);
-  assert.equal(stop.replies[0].flags, MessageFlags.Ephemeral);
+  assert.equal(stop.deferReplies.length, 1);
+  assert.equal(stop.deferReplies[0].flags, MessageFlags.Ephemeral);
+  assert.equal(stop.editReplies.length, 1);
   assert.equal(stop.messageEdits.length, 1);
+  assert.deepEqual(stopCallOrder, ['deferReply', 'musicService.stop', 'editReply', 'message.edit']);
 
   assert.deepEqual(calls, ['toggle:g1', 'skip:g1:1', 'loop:g1', 'shuffle:g1', 'stop:g1']);
   db.close();
@@ -585,9 +627,10 @@ test('handleInteraction enforces same-voice-channel and canControlPlayer on musi
   db.close();
 });
 
-test('Review Focus #5: stale music:* panel buttons when no player is active reply ephemerally in pt-BR and disable buttons cleanly', async () => {
+test('Review Focus #5: stale music:* panel buttons when no player is active reply ephemerally in pt-BR and disable buttons cleanly regardless of user voice state', async () => {
   const db = openDatabase(':memory:');
   const settingsRepo = new GuildSettingsRepository(db);
+  settingsRepo.update('g1', { djRoleId: 'dj-role' });
   const { logger } = makeSilentLogger();
 
   const noPlayerFailure = {
@@ -610,12 +653,11 @@ test('Review Focus #5: stale music:* panel buttons when no player is active repl
     getNowPlaying: () => null,
   });
 
-  const vc = makeVoiceChannel({ id: 'vc-1', humanCount: 1, includeBot: false });
-
+  // 1) User not in voice and bot out of voice (no active player)
   for (const customId of Object.values(PANEL_BUTTON_IDS)) {
     const { interaction, replies, messageEdits } = makeButtonInteraction({
       customId,
-      memberVoiceChannel: vc,
+      memberVoiceChannel: null,
       botVoiceChannel: null,
     });
 
@@ -625,20 +667,39 @@ test('Review Focus #5: stale music:* panel buttons when no player is active repl
       logger,
     });
 
-    assert.equal(replies.length, 1, `Expected ephemeral reply for ${customId}`);
+    assert.equal(replies.length, 1, `Expected ephemeral reply for ${customId} with memberVoiceChannel=null`);
     assert.equal(replies[0].flags, MessageFlags.Ephemeral);
-    assert.match(String(replies[0].content), /Não há nenhuma/);
+    assert.match(String(replies[0].content), /Não há nenhuma reprodução ativa/i);
 
     assert.equal(messageEdits.length, 1, `Expected message buttons disabled for ${customId}`);
     const editedRow = (messageEdits[0].components as Array<{ toJSON(): { components: Array<{ disabled: boolean }> } }>)[0].toJSON();
     assert.equal(editedRow.components.every((btn) => btn.disabled === true), true);
   }
 
-  // Also swallows Discord 10008 Unknown Message cleanly without throwing
+  // 2) Non-DJ user in a populated voice channel when bot is out of voice and idle
+  const populatedVc = makeVoiceChannel({ id: 'vc-1', humanCount: 3, includeBot: false });
+  const nonDjStale = makeButtonInteraction({
+    customId: PANEL_BUTTON_IDS.skip,
+    memberVoiceChannel: populatedVc,
+    botVoiceChannel: null,
+    memberRoleIds: [],
+    memberPerms: [],
+  });
+  await handleInteraction(nonDjStale.interaction as unknown as Interaction, {
+    musicService,
+    settingsRepo,
+    logger,
+  });
+  assert.equal(nonDjStale.replies.length, 1);
+  assert.equal(nonDjStale.replies[0].flags, MessageFlags.Ephemeral);
+  assert.match(String(nonDjStale.replies[0].content), /Não há nenhuma reprodução ativa/i);
+  assert.equal(nonDjStale.messageEdits.length, 1);
+
+  // 3) Also swallows Discord 10008 Unknown Message cleanly without throwing
   const unknownMsgErr = Object.assign(new Error('Unknown Message'), { code: 10008 });
   const staleDeleted = makeButtonInteraction({
     customId: PANEL_BUTTON_IDS.toggle,
-    memberVoiceChannel: vc,
+    memberVoiceChannel: null,
     botVoiceChannel: null,
     messageEditError: unknownMsgErr,
   });

@@ -1,8 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { PassThrough } from 'node:stream';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { GatewayIntentBits, type VoiceState } from 'discord.js';
-import type { EnvConfig } from '../../src/config/env.ts';
+import { loadEnv, type EnvConfig } from '../../src/config/env.ts';
 import { openDatabase } from '../../src/db/database.ts';
 import { SessionStoreRepository } from '../../src/db/sessionStoreRepository.ts';
 import { SqliteQueueStore } from '../../src/db/sqliteQueueStore.ts';
@@ -11,7 +14,7 @@ import type { MusicService } from '../../src/music/musicService.ts';
 import { createBot } from '../../src/bot/createBot.ts';
 import { MAIN_NODE_ID } from '../../src/bot/createLavalinkManager.ts';
 import { handleVoiceStateUpdate } from '../../src/bot/voiceStateHandler.ts';
-import '../../src/index.ts';
+import { main } from '../../src/index.ts';
 
 function makeLogger() {
   const stream = new PassThrough();
@@ -337,4 +340,46 @@ test('createBot wires minimal intents, Lavalink options, raw forwarding, Spotify
   assert.equal(destroyPlayerCalled, false);
   assert.throws(() => db.prepare('SELECT 1').get());
 });
+
+test('main logs safe startup validation errors to stderr without leaking secrets', async () => {
+  const stderrLines: string[] = [];
+
+  await assert.rejects(() =>
+    main({
+      loadEnv: () =>
+        loadEnv({
+          LAVALINK_PASSWORD: 'secret-lavalink-do-not-leak',
+          SPOTIFY_CLIENT_SECRET: 'secret-spotify-do-not-leak',
+        }),
+      writeStderr: (line) => stderrLines.push(line),
+    }),
+  );
+
+  assert.equal(stderrLines.length, 1);
+  assert.match(stderrLines[0], /DISCORD_TOKEN/);
+  assert.equal(stderrLines[0].includes('secret-lavalink-do-not-leak'), false);
+  assert.equal(stderrLines[0].includes('secret-spotify-do-not-leak'), false);
+
+  // Direct execution check: missing env vars exit with code 1 and write non-empty stderr without secrets
+  const worktreeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+  const child = spawnSync(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', '--import', 'tsx', 'src/index.ts'],
+    {
+      cwd: worktreeRoot,
+      env: {
+        PATH: process.env.PATH ?? '',
+        SystemRoot: process.env.SystemRoot ?? '',
+        LAVALINK_PASSWORD: 'secret-direct-run-password',
+      },
+      encoding: 'utf8',
+      timeout: 15_000,
+    },
+  );
+
+  assert.equal(child.status, 1);
+  assert.match(child.stderr, /DISCORD_TOKEN/);
+  assert.equal(child.stderr.includes('secret-direct-run-password'), false);
+});
+
 
