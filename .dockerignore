@@ -1,0 +1,14 @@
+node_modules
+dist
+data
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+.worktrees
+.superpowers
+docs
+tests
+*.log
+*.sqlite*

@@ -1,0 +1,39 @@
+services:
+  lavalink:
+    image: ghcr.io/lavalink-devs/lavalink:4.2-alpine
+    restart: unless-stopped
+    environment:
+      - JAVA_TOOL_OPTIONS=-Xmx1G
+      - LAVALINK_SERVER_PASSWORD=${LAVALINK_PASSWORD}
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
+      - SPOTIFY_SP_DC=${SPOTIFY_SP_DC:-}
+    volumes:
+      - ./lavalink/application.yml:/opt/Lavalink/application.yml:ro
+      - lavalink_plugins:/opt/Lavalink/plugins
+    healthcheck:
+      test: ["CMD-SHELL", 'wget --header="Authorization: $$LAVALINK_SERVER_PASSWORD" -q -O /dev/null http://127.0.0.1:2333/version || exit 1']
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      lavalink:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  lavalink_plugins:
