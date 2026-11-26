@@ -13,6 +13,12 @@ export const playCommand: SlashCommand = {
         .setName('busca')
         .setDescription('Nome da música ou link do YouTube/Spotify')
         .setRequired(true),
+    )
+    .addBooleanOption((option) =>
+      option
+        .setName('proxima')
+        .setDescription('Tocar como próxima música da fila (fura-fila)')
+        .setRequired(false),
     ),
 
   async execute(interaction, context) {
@@ -22,6 +28,7 @@ export const playCommand: SlashCommand = {
     }
 
     const query = interaction.options.getString('busca', true);
+    const playNext = interaction.options.getBoolean('proxima') ?? false;
     await interaction.deferReply();
 
     const result = await context.musicService.play({
@@ -30,6 +37,7 @@ export const playCommand: SlashCommand = {
       textChannelId: interaction.channelId,
       query,
       requester: interaction.user,
+      playNext,
     });
 
     if (!result.ok) {
@@ -40,15 +48,28 @@ export const playCommand: SlashCommand = {
     const embed = new EmbedBuilder().setColor(result.startedImmediately ? 0x1db954 : COMMAND_EMBED_COLOR);
 
     if (result.isPlaylist) {
-      embed.setTitle('🎶 Playlist Adicionada').setDescription(result.message);
+      embed
+        .setTitle(
+          playNext && !result.startedImmediately
+            ? '⏭️ Playlist na Frente da Fila'
+            : '🎶 Playlist Adicionada',
+        )
+        .setDescription(result.message);
     } else {
       const { info } = result.firstTrack;
       const trackTitle = info.uri ? `[${info.title}](${info.uri})` : info.title;
       const duration = formatDuration(info.duration, Boolean(info.isStream));
+      const duplicateNote = result.duplicateInQueue ? '\n⚠️ *Esta música já estava na fila.*' : '';
       embed
-        .setTitle(result.startedImmediately ? '🎵 Tocando Agora' : '➕ Adicionada à Fila')
+        .setTitle(
+          result.startedImmediately
+            ? '🎵 Tocando Agora'
+            : playNext
+              ? '⏭️ Próxima da Fila'
+              : '➕ Adicionada à Fila',
+        )
         .setDescription(
-          `**${trackTitle}**\npor ${info.author ?? 'Desconhecido'} • \`${duration}\``,
+          `**${trackTitle}**\npor ${info.author ?? 'Desconhecido'} • \`${duration}\`${duplicateNote}`,
         );
 
       if (info.artworkUrl) {

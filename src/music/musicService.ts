@@ -6,6 +6,8 @@ import type { AppLogger } from '../utils/logger.js';
 import { TrackCircuitBreaker } from './circuitBreaker.js';
 import {
   PanelTracker,
+  buildNowPlayingEmbed,
+  buildPanelComponents,
   type EditablePanelMessage,
   type PanelMessageRef,
   type PanelTrackView,
@@ -22,6 +24,7 @@ export type { RepeatMode } from 'lavalink-client';
  */
 export const LAVALINK_RESUME_TIMEOUT_SECONDS = 60;
 export const DEFAULT_REJOIN_STAGGER_MS = 250;
+export const DEFAULT_PANEL_UPDATE_INTERVAL_MS = 5_000;
 
 const REPEAT_CYCLE_ORDER: readonly RepeatMode[] = ['off', 'track', 'queue'];
 
@@ -59,9 +62,9 @@ export interface GatewaySearchResult {
 export interface GatewayQueue {
   current: GatewayTrack | null;
   tracks: readonly GatewayTrack[];
-  add(tracks: GatewayTrack | GatewayTrack[]): Promise<unknown>;
+  add(tracks: GatewayTrack | GatewayTrack[], index?: number): Promise<unknown>;
   shuffle(): Promise<unknown>;
-  splice(index: number, amount: number): Promise<unknown>;
+  splice(index: number, amount: number, tracks?: GatewayTrack | GatewayTrack[]): Promise<unknown>;
 }
 
 export interface GatewayPlayer {
@@ -175,6 +178,7 @@ export interface PlayInput {
   textChannelId: string;
   query: string;
   requester: unknown;
+  playNext?: boolean;
 }
 
 export type PlayResult =
@@ -187,6 +191,7 @@ export type PlayResult =
       addedCount: number;
       truncatedCount: number;
       startedImmediately: boolean;
+      duplicateInQueue?: boolean;
       message: string;
     }
   | {
@@ -246,11 +251,25 @@ export type LoopResult =
   | ActionFailure;
 
 export type VolumeResult =
-  | { ok: true; volume: number; message: string }
+  | { ok: true; volume: number; muted?: boolean; message: string }
   | ActionFailure;
 
 export type RemoveResult =
   | { ok: true; removedTrack: GatewayTrack; position: number; message: string }
+  | ActionFailure;
+
+export type MoveResult =
+  | {
+      ok: true;
+      track: GatewayTrack;
+      fromPosition: number;
+      toPosition: number;
+      message: string;
+    }
+  | ActionFailure;
+
+export type DedupeResult =
+  | { ok: true; removedCount: number; message: string }
   | ActionFailure;
 
 export type ClearQueueResult =
@@ -273,6 +292,7 @@ export interface NowPlayingSnapshot {
 
 export interface QueueSnapshot {
   currentTrack: QueueTrackView | null;
+  currentPositionMs?: number;
   queue: QueueTrackView[];
   repeatMode: RepeatMode;
   paused: boolean;
@@ -292,6 +312,7 @@ export interface MusicServiceDeps {
   circuitBreaker?: TrackCircuitBreaker;
   panelTracker?: PanelTracker;
   rejoinStaggerMs?: number;
+  panelUpdateIntervalMs?: number;
 }
 
 interface PendingStagger {
@@ -352,6 +373,20 @@ function formatRepeatModePtBr(mode: RepeatMode): string {
   }
 }
 
+function getTrackKey(track: GatewayTrack): string {
+  const identifier = track.info.identifier?.trim();
+  if (identifier) {
+    return `id:${identifier}`;
+  }
+  const uri = track.info.uri?.trim().replace(/\/+$/, '');
+  if (uri) {
+    return `uri:${uri.toLowerCase()}`;
+  }
+  const title = track.info.title.trim().toLowerCase();
+  const author = (track.info.author ?? '').trim().toLowerCase();
+  return `meta:${title}::${author}`;
+}
+
 /**
  * Decoupled core orchestration service for guild music playback, queue enforcement,
  * interactive panels, 24/7 persistence, circuit-breaker recovery, and session resume.
@@ -366,6 +401,7 @@ export class MusicService {
   private readonly spotifyEnabled: boolean;
   private readonly maxQueueSize: number;
   private readonly rejoinStaggerMs: number;
+  private readonly panelUpdateIntervalMs: number;
   private readonly timers: TimerManager;
   private readonly circuitBreaker: TrackCircuitBreaker;
   private readonly panelTracker: PanelTracker;
@@ -376,6 +412,9 @@ export class MusicService {
   private readonly pausedByEmptyChannel = new Set<string>();
   private readonly guildLocks = new Map<string, Promise<void>>();
   private readonly pendingStaggers = new Set<PendingStagger>();
+  private readonly previousVolumeByGuild = new Map<string, number>();
+  private readonly panelUpdateIntervals = new Map<string, NodeJS.Timeout>();
+  private readonly panelRefreshInFlight = new Set<string>();
   private shuttingDown = false;
 
   constructor(deps: MusicServiceDeps) {
@@ -388,6 +427,10 @@ export class MusicService {
     this.spotifyEnabled = deps.spotifyEnabled;
     this.maxQueueSize = deps.maxQueueSize;
     this.rejoinStaggerMs = deps.rejoinStaggerMs ?? DEFAULT_REJOIN_STAGGER_MS;
+    this.panelUpdateIntervalMs = Math.max(
+      0,
+      deps.panelUpdateIntervalMs ?? DEFAULT_PANEL_UPDATE_INTERVAL_MS,
+    );
     this.timers =
       deps.timerManager ??
       new TimerManager((guildId, error) => {
@@ -517,14 +560,31 @@ export class MusicService {
         });
       }
 
-      await player.queue.add(tracksToAdd);
+      let duplicateInQueue = false;
+      if (!isPlaylist && tracksToAdd.length > 0) {
+        const incomingKey = getTrackKey(tracksToAdd[0]);
+        const existingTracks: GatewayTrack[] = [
+          ...(player.queue.current ? [player.queue.current] : []),
+          ...player.queue.tracks,
+        ];
+        duplicateInQueue = existingTracks.some((track) => getTrackKey(track) === incomingKey);
+      }
 
       const startedImmediately = !player.playing && !player.queue.current;
+      if (input.playNext && !startedImmediately) {
+        await player.queue.add(tracksToAdd, 0);
+      } else {
+        await player.queue.add(tracksToAdd);
+      }
+
       if (startedImmediately) {
         await player.play();
       }
 
       this.persistActiveSession(input.guildId, player, input.voiceChannelId, input.textChannelId);
+      if (!startedImmediately) {
+        void this.refreshActivePanel(input.guildId);
+      }
 
       const firstTrack = tracksToAdd[0];
       const playlistName =
@@ -532,15 +592,23 @@ export class MusicService {
 
       let message: string;
       if (isPlaylist) {
+        const positionNote = input.playNext && !startedImmediately ? ' no início da fila' : '';
         message =
           truncatedCount > 0
-            ? `Playlist **${playlistName}** adicionada com **${addedCount}** músicas (${truncatedCount} ignoradas pelo limite de ${this.maxQueueSize} da fila).`
-            : `Playlist **${playlistName}** adicionada com **${addedCount}** músicas.`;
+            ? `Playlist **${playlistName}** adicionada${positionNote} com **${addedCount}** músicas (${truncatedCount} ignoradas pelo limite de ${this.maxQueueSize} da fila).`
+            : `Playlist **${playlistName}** adicionada${positionNote} com **${addedCount}** músicas.`;
       } else {
         const author = firstTrack.info.author ?? 'Desconhecido';
-        message = startedImmediately
-          ? `Tocando agora: **${firstTrack.info.title}** — ${author}.`
-          : `Adicionada à fila: **${firstTrack.info.title}** — ${author}.`;
+        const duplicateSuffix = duplicateInQueue
+          ? ' (Aviso: esta música já estava na fila.)'
+          : '';
+        if (startedImmediately) {
+          message = `Tocando agora: **${firstTrack.info.title}** — ${author}.`;
+        } else if (input.playNext) {
+          message = `Adicionada como próxima da fila: **${firstTrack.info.title}** — ${author}.${duplicateSuffix}`;
+        } else {
+          message = `Adicionada à fila: **${firstTrack.info.title}** — ${author}.${duplicateSuffix}`;
+        }
       }
 
       return {
@@ -552,6 +620,7 @@ export class MusicService {
         addedCount,
         truncatedCount,
         startedImmediately,
+        duplicateInQueue,
         message,
       };
     });
@@ -577,6 +646,7 @@ export class MusicService {
 
     this.pausedByEmptyChannel.delete(guildId);
     await player.pause();
+    void this.refreshActivePanel(guildId);
     return { ok: true, paused: true, message: 'Reprodução pausada.' };
   }
 
@@ -600,6 +670,7 @@ export class MusicService {
 
     this.pausedByEmptyChannel.delete(guildId);
     await player.resume();
+    void this.refreshActivePanel(guildId);
     return { ok: true, paused: false, message: 'Reprodução retomada.' };
   }
 
@@ -616,10 +687,12 @@ export class MusicService {
     this.pausedByEmptyChannel.delete(guildId);
     if (player.paused) {
       await player.resume();
+      void this.refreshActivePanel(guildId);
       return { ok: true, paused: false, message: 'Reprodução retomada.' };
     }
 
     await player.pause();
+    void this.refreshActivePanel(guildId);
     return { ok: true, paused: true, message: 'Reprodução pausada.' };
   }
 
@@ -689,6 +762,8 @@ export class MusicService {
     }
 
     this.timers.cancel(guildId);
+    this.stopPanelUpdater(guildId);
+    this.previousVolumeByGuild.delete(guildId);
     this.circuitBreaker.reset(guildId);
     this.pausedByEmptyChannel.delete(guildId);
     await this.disableActivePanel(guildId);
@@ -731,6 +806,7 @@ export class MusicService {
     }
 
     await player.queue.shuffle();
+    void this.refreshActivePanel(guildId);
     return {
       ok: true,
       queueLength: player.queue.tracks.length,
@@ -753,6 +829,7 @@ export class MusicService {
 
     await player.setRepeatMode(mode);
     this.persistActiveSession(guildId, player);
+    void this.refreshActivePanel(guildId);
 
     return {
       ok: true,
@@ -797,11 +874,88 @@ export class MusicService {
       };
     }
 
+    if (volume === 0 && player.volume > 0) {
+      this.previousVolumeByGuild.set(guildId, player.volume);
+    } else if (volume > 0) {
+      this.previousVolumeByGuild.delete(guildId);
+    }
+
     await player.setVolume(volume);
+    void this.refreshActivePanel(guildId);
+
     return {
       ok: true,
       volume,
-      message: `Volume ajustado para **${volume}%**.`,
+      muted: volume === 0,
+      message: volume === 0 ? 'Áudio mutado (**0%**).' : `Volume ajustado para **${volume}%**.`,
+    };
+  }
+
+  /**
+   * Adjusts active session volume relatively by `delta`, clamping within `0..150`.
+   */
+  async adjustVolume(guildId: string, delta: number): Promise<VolumeResult> {
+    if (!Number.isInteger(delta)) {
+      return {
+        ok: false,
+        reason: 'INVALID_VOLUME',
+        message: 'O ajuste de volume deve ser um número inteiro.',
+      };
+    }
+
+    const player = this.gateway.getPlayer(guildId);
+    if (!player) {
+      return {
+        ok: false,
+        reason: 'NO_PLAYER',
+        message: 'Não há nenhum player ativo no momento.',
+      };
+    }
+
+    const nextVolume = Math.min(150, Math.max(0, Math.round(player.volume + delta)));
+    if (nextVolume === 0 && player.volume > 0) {
+      this.previousVolumeByGuild.set(guildId, player.volume);
+    }
+    return this.setVolume(guildId, nextVolume);
+  }
+
+  /**
+   * Toggles mute on the active player, saving and restoring the previous non-zero volume.
+   */
+  async toggleMute(guildId: string): Promise<VolumeResult> {
+    const player = this.gateway.getPlayer(guildId);
+    if (!player) {
+      return {
+        ok: false,
+        reason: 'NO_PLAYER',
+        message: 'Não há nenhum player ativo no momento.',
+      };
+    }
+
+    if (player.volume > 0) {
+      this.previousVolumeByGuild.set(guildId, player.volume);
+      const res = await this.setVolume(guildId, 0);
+      if (!res.ok) {
+        return res;
+      }
+      return { ...res, muted: true };
+    }
+
+    const savedPrevious = this.previousVolumeByGuild.get(guildId);
+    const defaultVolume = this.settingsRepo.getOrDefault(guildId).defaultVolume;
+    const candidate = savedPrevious ?? (defaultVolume > 0 ? defaultVolume : 80);
+    const restoredVolume = Math.min(150, Math.max(1, Math.round(candidate)));
+    this.previousVolumeByGuild.delete(guildId);
+
+    const res = await this.setVolume(guildId, restoredVolume);
+    if (!res.ok) {
+      return res;
+    }
+
+    return {
+      ...res,
+      muted: false,
+      message: `Áudio desmutado (**${restoredVolume}%**).`,
     };
   }
 
@@ -846,12 +1000,140 @@ export class MusicService {
 
     const removedTrack = player.queue.tracks[index];
     await player.queue.splice(index, 1);
+    void this.refreshActivePanel(guildId);
 
     return {
       ok: true,
       removedTrack,
       position,
       message: `Removida da fila (posição **${position}**): **${removedTrack.info.title}**.`,
+    };
+  }
+
+  /**
+   * Moves a 1-indexed track from `fromPosition` to `toPosition` in the upcoming queue.
+   */
+  async moveTrack(
+    guildId: string,
+    fromPosition: number,
+    toPosition: number,
+  ): Promise<MoveResult> {
+    if (
+      !Number.isInteger(fromPosition) ||
+      fromPosition < 1 ||
+      !Number.isInteger(toPosition) ||
+      toPosition < 1
+    ) {
+      return {
+        ok: false,
+        reason: 'INVALID_POSITION',
+        message: 'Informe posições válidas (mínimo 1).',
+      };
+    }
+
+    const player = this.gateway.getPlayer(guildId);
+    if (!player) {
+      return {
+        ok: false,
+        reason: 'NO_PLAYER',
+        message: 'Não há nenhuma reprodução ativa no momento.',
+      };
+    }
+
+    const total = player.queue.tracks.length;
+    if (total === 0) {
+      return {
+        ok: false,
+        reason: 'EMPTY_QUEUE',
+        message: 'A fila está vazia.',
+      };
+    }
+
+    if (fromPosition > total || toPosition > total) {
+      return {
+        ok: false,
+        reason: 'OUT_OF_RANGE',
+        message: `Posição inválida. A fila possui **${total}** ${total === 1 ? 'música' : 'músicas'}.`,
+      };
+    }
+
+    if (fromPosition === toPosition) {
+      return {
+        ok: false,
+        reason: 'INVALID_POSITION',
+        message: 'A música já está nessa posição da fila.',
+      };
+    }
+
+    const track = player.queue.tracks[fromPosition - 1];
+    await player.queue.splice(fromPosition - 1, 1);
+    await player.queue.add(track, toPosition - 1);
+    void this.refreshActivePanel(guildId);
+
+    return {
+      ok: true,
+      track,
+      fromPosition,
+      toPosition,
+      message: `Movida **${track.info.title}** da posição **${fromPosition}** para **${toPosition}**.`,
+    };
+  }
+
+  /**
+   * Removes duplicate tracks from the upcoming queue (also deduplicating against the current track).
+   */
+  async removeDuplicates(guildId: string): Promise<DedupeResult> {
+    const player = this.gateway.getPlayer(guildId);
+    if (!player) {
+      return {
+        ok: false,
+        reason: 'NO_PLAYER',
+        message: 'Não há nenhuma reprodução ativa no momento.',
+      };
+    }
+
+    if (player.queue.tracks.length === 0) {
+      return {
+        ok: false,
+        reason: 'EMPTY_QUEUE',
+        message: 'A fila está vazia.',
+      };
+    }
+
+    const seen = new Set<string>();
+    if (player.queue.current) {
+      seen.add(getTrackKey(player.queue.current));
+    }
+
+    const duplicateIndices: number[] = [];
+    for (let i = 0; i < player.queue.tracks.length; i += 1) {
+      const key = getTrackKey(player.queue.tracks[i]);
+      if (seen.has(key)) {
+        duplicateIndices.push(i);
+      } else {
+        seen.add(key);
+      }
+    }
+
+    const removedCount = duplicateIndices.length;
+    if (removedCount === 0) {
+      return {
+        ok: true,
+        removedCount: 0,
+        message: 'Nenhuma música duplicada encontrada na fila.',
+      };
+    }
+
+    for (let idx = duplicateIndices.length - 1; idx >= 0; idx -= 1) {
+      await player.queue.splice(duplicateIndices[idx], 1);
+    }
+
+    void this.refreshActivePanel(guildId);
+
+    return {
+      ok: true,
+      removedCount,
+      message: `Removidas **${removedCount}** ${removedCount === 1 ? 'música duplicada' : 'músicas duplicadas'} da fila.`,
     };
   }
 
@@ -878,6 +1160,7 @@ export class MusicService {
     }
 
     await player.queue.splice(0, clearedCount);
+    void this.refreshActivePanel(guildId);
     return {
       ok: true,
       clearedCount,
@@ -916,6 +1199,7 @@ export class MusicService {
 
     return {
       currentTrack: player.queue.current ? toQueueTrackView(player.queue.current) : null,
+      currentPositionMs: player.position ?? 0,
       queue: player.queue.tracks.map(toQueueTrackView),
       repeatMode: player.repeatMode,
       paused: player.paused,
@@ -929,6 +1213,7 @@ export class MusicService {
   async registerPanel(guildId: string, ref: PanelMessageRef): Promise<void> {
     await this.disableActivePanel(guildId);
     this.panelTracker.setPanel(guildId, ref);
+    this.startPanelUpdater(guildId);
     const player = this.gateway.getPlayer(guildId);
     if (player) {
       this.persistActiveSession(guildId, player, undefined, ref.channelId, ref);
@@ -1029,6 +1314,7 @@ export class MusicService {
         });
         if (panelRef) {
           this.panelTracker.setPanel(guildId, panelRef);
+          this.startPanelUpdater(guildId);
         }
       } catch (error) {
         this.logger.warn(
@@ -1068,6 +1354,7 @@ export class MusicService {
    * Handles Lavalink `queueEnd`: disables active panel and schedules auto-leave when 24/7 is disabled.
    */
   async handleQueueEnd(guildId: string): Promise<void> {
+    this.stopPanelUpdater(guildId);
     await this.disableActivePanel(guildId);
     this.pausedByEmptyChannel.delete(guildId);
 
@@ -1132,6 +1419,8 @@ export class MusicService {
     }
 
     this.timers.cancel(guildId);
+    this.stopPanelUpdater(guildId);
+    this.previousVolumeByGuild.delete(guildId);
     this.circuitBreaker.reset(guildId);
     this.emptyGuildChannels.delete(guildId);
     this.pausedByEmptyChannel.delete(guildId);
@@ -1266,6 +1555,7 @@ export class MusicService {
           channelId: saved.panelChannelId,
           messageId: saved.panelMessageId,
         });
+        this.startPanelUpdater(resumed.guildId);
       }
 
       if (!saved && textChannelId) {
@@ -1308,6 +1598,8 @@ export class MusicService {
     if (nodeId && sessionId) {
       this.sessionStore.saveNodeSessionId(nodeId, sessionId);
     }
+
+    this.stopAllPanelUpdaters();
 
     const active = this.sessionStore.listActivePlayers();
     for (const session of active) {
@@ -1394,6 +1686,7 @@ export class MusicService {
   async shutdownGracefully(): Promise<void> {
     this.shuttingDown = true;
     this.timers.clearAll();
+    this.stopAllPanelUpdaters();
     for (const pending of Array.from(this.pendingStaggers)) {
       pending.resolve();
     }
@@ -1494,6 +1787,7 @@ export class MusicService {
     this.botInitiatedDisconnects.add(guildId);
     this.emptyGuildChannels.delete(guildId);
     this.pausedByEmptyChannel.delete(guildId);
+    this.previousVolumeByGuild.delete(guildId);
     await this.disableActivePanel(guildId);
     this.sessionStore.deleteActivePlayer(guildId);
 
@@ -1509,9 +1803,110 @@ export class MusicService {
   }
 
   private async disableActivePanel(guildId: string): Promise<void> {
+    this.stopPanelUpdater(guildId);
     await this.panelTracker.disablePanelSafely(guildId, (ref) =>
       this.messenger.fetchPanelMessage(ref),
     );
+  }
+
+  private startPanelUpdater(guildId: string): void {
+    this.stopPanelUpdater(guildId);
+
+    if (this.shuttingDown || this.panelUpdateIntervalMs <= 0) {
+      return;
+    }
+
+    if (!this.panelTracker.getPanel(guildId)) {
+      return;
+    }
+
+    const handle = setInterval(() => {
+      if (this.shuttingDown) {
+        this.stopPanelUpdater(guildId);
+        return;
+      }
+
+      const player = this.gateway.getPlayer(guildId);
+      const currentTrack = player?.queue.current;
+      if (!player || !currentTrack) {
+        return;
+      }
+
+      if (player.paused || currentTrack.info.isStream) {
+        return;
+      }
+
+      void this.refreshActivePanel(guildId);
+    }, this.panelUpdateIntervalMs);
+
+    handle.unref?.();
+    this.panelUpdateIntervals.set(guildId, handle);
+  }
+
+  private stopPanelUpdater(guildId: string): void {
+    const handle = this.panelUpdateIntervals.get(guildId);
+    if (handle) {
+      clearInterval(handle);
+      this.panelUpdateIntervals.delete(guildId);
+    }
+  }
+
+  private stopAllPanelUpdaters(): void {
+    for (const handle of this.panelUpdateIntervals.values()) {
+      clearInterval(handle);
+    }
+    this.panelUpdateIntervals.clear();
+  }
+
+  private async refreshActivePanel(guildId: string): Promise<void> {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    if (!this.panelTracker.getPanel(guildId)) {
+      this.stopPanelUpdater(guildId);
+      return;
+    }
+
+    if (this.panelRefreshInFlight.has(guildId)) {
+      return;
+    }
+
+    this.panelRefreshInFlight.add(guildId);
+    try {
+      const snapshot = this.getNowPlaying(guildId);
+      if (!snapshot) {
+        this.stopPanelUpdater(guildId);
+        return;
+      }
+
+      const embed = buildNowPlayingEmbed({
+        track: snapshot.track,
+        paused: snapshot.paused,
+        volume: snapshot.volume,
+        repeatMode: snapshot.repeatMode,
+        queueLength: snapshot.queueLength,
+      });
+      const components = buildPanelComponents({
+        paused: snapshot.paused,
+        repeatMode: snapshot.repeatMode,
+        volume: snapshot.volume,
+      });
+
+      const kept = await this.panelTracker.updatePanelSafely(
+        guildId,
+        (ref) => this.messenger.fetchPanelMessage(ref),
+        { embeds: [embed], components },
+      );
+
+      if (!kept) {
+        this.stopPanelUpdater(guildId);
+      }
+    } catch (error) {
+      this.logger.warn({ err: error, guildId }, 'Falha ao atualizar painel Tocando Agora');
+    } finally {
+      this.panelRefreshInFlight.delete(guildId);
+    }
   }
 
   private resolveTextChannelId(guildId: string, player: GatewayPlayer | null): string | null {

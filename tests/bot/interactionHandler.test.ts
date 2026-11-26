@@ -14,6 +14,8 @@ import { GuildSettingsRepository } from '../../src/db/guildSettingsRepository.ts
 import { createLogger } from '../../src/utils/logger.ts';
 import {
   PANEL_BUTTON_IDS,
+  QUEUE_ACTION_IDS,
+  QUEUE_ACTION_PREFIX,
   QUEUE_BUTTON_PREFIX,
   buildControlButtons,
 } from '../../src/music/playerPanel.ts';
@@ -275,7 +277,34 @@ function makeMusicServiceMock(overrides: Partial<MusicService> = {}): MusicServi
       disconnected: true,
       message: 'Reprodução parada, fila limpa e desconectado do canal de voz.',
     }),
+    adjustVolume: async (_guildId, delta) => ({
+      ok: true,
+      volume: Math.max(0, Math.min(150, 80 + delta)),
+      message: `Volume ajustado para **${80 + delta}%**.`,
+    }),
+    toggleMute: async () => ({
+      ok: true,
+      volume: 0,
+      muted: true,
+      message: 'Áudio mutado (**0%**).',
+    }),
     getNowPlaying: () => makeSnapshot(),
+    getQueue: () => ({
+      currentTrack: {
+        title: 'Evidências',
+        author: 'Chitãozinho & Xororó',
+        uri: 'https://www.youtube.com/watch?v=123',
+        durationMs: 240_000,
+        isStream: false,
+        requesterId: 'user-1',
+        requesterTag: 'User#0001',
+      },
+      currentPositionMs: 30_000,
+      queue: [],
+      repeatMode: 'off',
+      paused: false,
+      volume: 80,
+    }),
     ...overrides,
   };
   return mock as MusicService;
@@ -367,26 +396,28 @@ test('handleInteraction dispatches chat input commands and catches unexpected th
   db.close();
 });
 
-test('handleInteraction ignores queue pagination buttons left to /queue collector', async () => {
+test('handleInteraction ignores queue pagination and queue action buttons left to /queue collector', async () => {
   const db = openDatabase(':memory:');
   const settingsRepo = new GuildSettingsRepository(db);
   const { logger } = makeSilentLogger();
   const musicService = makeMusicServiceMock();
 
-  const { interaction, replies, updates, messageEdits } = makeButtonInteraction({
-    customId: `${QUEUE_BUTTON_PREFIX}2`,
-    memberVoiceChannel: null,
-  });
+  for (const customId of [`${QUEUE_BUTTON_PREFIX}2`, QUEUE_ACTION_IDS.shuffle, `${QUEUE_ACTION_PREFIX}custom`]) {
+    const { interaction, replies, updates, messageEdits } = makeButtonInteraction({
+      customId,
+      memberVoiceChannel: null,
+    });
 
-  await handleInteraction(interaction as unknown as Interaction, {
-    musicService,
-    settingsRepo,
-    logger,
-  });
+    await handleInteraction(interaction as unknown as Interaction, {
+      musicService,
+      settingsRepo,
+      logger,
+    });
 
-  assert.equal(replies.length, 0);
-  assert.equal(updates.length, 0);
-  assert.equal(messageEdits.length, 0);
+    assert.equal(replies.length, 0);
+    assert.equal(updates.length, 0);
+    assert.equal(messageEdits.length, 0);
+  }
   db.close();
 });
 
@@ -714,5 +745,109 @@ test('Review Focus #5: stale music:* panel buttons when no player is active repl
   assert.equal(staleDeleted.replies.length, 1);
   assert.equal(staleDeleted.replies[0].flags, MessageFlags.Ephemeral);
 
+  db.close();
+});
+
+test('handleInteraction handles music:vol_down, music:vol_up, music:mute, and music:queue panel buttons', async () => {
+  const db = openDatabase(':memory:');
+  const settingsRepo = new GuildSettingsRepository(db);
+  settingsRepo.update('g1', { djRoleId: 'dj-role' });
+  const { logger } = makeSilentLogger();
+
+  let volume = 80;
+  let muted = false;
+  const calls: string[] = [];
+
+  const musicService = makeMusicServiceMock({
+    adjustVolume: async (guildId, delta) => {
+      calls.push(`adjust:${guildId}:${delta}`);
+      volume = Math.max(0, Math.min(150, volume + delta));
+      muted = volume === 0;
+      return { ok: true, volume, muted, message: `Volume ajustado para **${volume}%**.` };
+    },
+    toggleMute: async (guildId) => {
+      calls.push(`mute:${guildId}`);
+      if (volume > 0) {
+        volume = 0;
+        muted = true;
+      } else {
+        volume = 70;
+        muted = false;
+      }
+      return { ok: true, volume, muted, message: 'Mudo alternado.' };
+    },
+    getNowPlaying: () => makeSnapshot({ volume }),
+  });
+
+  const vc = makeVoiceChannel({ id: 'vc-1', humanCount: 1 });
+
+  // Volume -10%
+  const volDown = makeButtonInteraction({
+    customId: PANEL_BUTTON_IDS.volumeDown,
+    memberVoiceChannel: vc,
+    botVoiceChannel: vc,
+  });
+  await handleInteraction(volDown.interaction as unknown as Interaction, {
+    musicService,
+    settingsRepo,
+    logger,
+  });
+  assert.equal(volDown.updates.length, 1);
+  const downComponents = volDown.updates[0].components as Array<{
+    toJSON: () => { components: Array<{ label?: string }> };
+  }>;
+  assert.equal(downComponents.length, 2);
+
+  // Volume +10%
+  const volUp = makeButtonInteraction({
+    customId: PANEL_BUTTON_IDS.volumeUp,
+    memberVoiceChannel: vc,
+    botVoiceChannel: vc,
+  });
+  await handleInteraction(volUp.interaction as unknown as Interaction, {
+    musicService,
+    settingsRepo,
+    logger,
+  });
+  assert.equal(volUp.updates.length, 1);
+
+  // Mute toggle
+  const mute = makeButtonInteraction({
+    customId: PANEL_BUTTON_IDS.mute,
+    memberVoiceChannel: vc,
+    botVoiceChannel: vc,
+  });
+  await handleInteraction(mute.interaction as unknown as Interaction, {
+    musicService,
+    settingsRepo,
+    logger,
+  });
+  assert.equal(mute.updates.length, 1);
+  const muteRow2 = (
+    mute.updates[0].components as Array<{
+      toJSON: () => { components: Array<{ label?: string }> };
+    }>
+  )[1].toJSON();
+  assert.equal(muteRow2.components[1].label, '🔊 Desmutar');
+
+  // music:queue allows viewing ephemerally WITHOUT voice membership or DJ role
+  const populatedBotVc = makeVoiceChannel({ id: 'vc-1', humanCount: 3 });
+  const viewQueue = makeButtonInteraction({
+    customId: PANEL_BUTTON_IDS.queue,
+    memberVoiceChannel: null,
+    botVoiceChannel: populatedBotVc,
+    memberRoleIds: [],
+    memberPerms: [],
+  });
+  await handleInteraction(viewQueue.interaction as unknown as Interaction, {
+    musicService,
+    settingsRepo,
+    logger,
+  });
+  assert.equal(viewQueue.replies.length, 1);
+  assert.equal(viewQueue.replies[0].flags, MessageFlags.Ephemeral);
+  assert.ok(Array.isArray(viewQueue.replies[0].embeds) && viewQueue.replies[0].embeds.length === 1);
+
+  assert.deepEqual(calls, ['adjust:g1:-10', 'adjust:g1:10', 'mute:g1']);
   db.close();
 });

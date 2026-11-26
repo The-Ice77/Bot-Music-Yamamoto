@@ -8,8 +8,8 @@ import { SessionStoreRepository } from '../db/sessionStoreRepository.js';
 import { SqliteQueueStore } from '../db/sqliteQueueStore.js';
 import { MusicService, type GuildMessenger } from '../music/musicService.js';
 import {
-  buildControlButtons,
   buildNowPlayingEmbed,
+  buildPanelComponents,
   type EditablePanelMessage,
   type PanelMessageRef,
 } from '../music/playerPanel.js';
@@ -77,14 +77,15 @@ function createDiscordGuildMessenger(client: Client): GuildMessenger {
         repeatMode: payload.repeatMode,
         queueLength: payload.queueLength,
       });
-      const row = buildControlButtons({
+      const components = buildPanelComponents({
         paused: payload.paused,
         repeatMode: payload.repeatMode,
+        volume: payload.volume,
       });
 
       const sent = await channel.send({
         embeds: [embed],
-        components: [row],
+        components,
       });
 
       return {

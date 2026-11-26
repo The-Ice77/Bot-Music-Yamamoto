@@ -14,7 +14,7 @@ import type { EnvConfig } from '../../src/config/env.ts';
 import { openDatabase } from '../../src/db/database.ts';
 import { GuildSettingsRepository } from '../../src/db/guildSettingsRepository.ts';
 import { createLogger } from '../../src/utils/logger.ts';
-import { QUEUE_BUTTON_PREFIX } from '../../src/music/playerPanel.ts';
+import { QUEUE_ACTION_IDS, QUEUE_BUTTON_PREFIX } from '../../src/music/playerPanel.ts';
 import type { MusicService, RepeatMode } from '../../src/music/musicService.ts';
 import { allCommands, commandsByName } from '../../src/commands/index.ts';
 import { enforceCommandGuards } from '../../src/commands/guards.ts';
@@ -33,6 +33,7 @@ const EXPECTED_COMMAND_NAMES = [
   'loop',
   'volume',
   'remove',
+  'move',
   'clear',
   'config',
 ] as const;
@@ -347,6 +348,24 @@ function makeFakeMusicService() {
         message: 'Removida da fila (posição **1**): **Removida**.',
       };
     },
+    moveTrack: async (...args: unknown[]) => {
+      calls.push({ method: 'moveTrack', args });
+      return {
+        ok: true,
+        fromPosition: args[1] as number,
+        toPosition: args[2] as number,
+        track: { info: { title: 'Movida' } },
+        message: `Movida **Movida** da posição **${args[1]}** para **${args[2]}**.`,
+      };
+    },
+    removeDuplicates: async (...args: unknown[]) => {
+      calls.push({ method: 'removeDuplicates', args });
+      return {
+        ok: true,
+        removedCount: 2,
+        message: 'Removidas **2** músicas duplicadas da fila.',
+      };
+    },
     clearQueue: async (...args: unknown[]) => {
       calls.push({ method: 'clearQueue', args });
       return { ok: true, clearedCount: 3, message: 'Fila limpa (**3** músicas removidas).' };
@@ -382,6 +401,7 @@ function makeFakeMusicService() {
           isStream: false,
           requesterId: 'user-1',
         },
+        currentPositionMs: 45_000,
         queue: Array.from({ length: 15 }, (_, i) => ({
           title: `Faixa ${i + 1}`,
           author: `Autor ${i + 1}`,
@@ -434,9 +454,9 @@ function makeTestContext(musicService?: unknown): {
   };
 }
 
-test('all 13 commands exist in commandsByName and serialize cleanly via .data.toJSON()', () => {
-  assert.equal(allCommands.length, 13);
-  assert.equal(commandsByName.size, 13);
+test('all 14 commands exist in commandsByName and serialize cleanly via .data.toJSON()', () => {
+  assert.equal(allCommands.length, 14);
+  assert.equal(commandsByName.size, 14);
 
   for (const name of EXPECTED_COMMAND_NAMES) {
     const cmd = commandsByName.get(name);
@@ -450,11 +470,14 @@ test('all 13 commands exist in commandsByName and serialize cleanly via .data.to
 
 test('command option schemas and constraints match spec', () => {
   const playJson = commandsByName.get('play')!.data.toJSON();
-  assert.equal(playJson.options?.length, 1);
+  assert.equal(playJson.options?.length, 2);
   assert.equal(playJson.options?.[0]?.name, 'busca');
   assert.equal(playJson.options?.[0]?.type, ApplicationCommandOptionType.String);
   assert.equal(playJson.options?.[0]?.required, true);
   assert.equal('autocomplete' in playJson.options![0] ? playJson.options![0].autocomplete : undefined, undefined);
+  assert.equal(playJson.options?.[1]?.name, 'proxima');
+  assert.equal(playJson.options?.[1]?.type, ApplicationCommandOptionType.Boolean);
+  assert.equal(Boolean(playJson.options?.[1]?.required), false);
 
   const volumeJson = commandsByName.get('volume')!.data.toJSON();
   const volumeOption = volumeJson.options?.[0] as {
@@ -501,6 +524,17 @@ test('command option schemas and constraints match spec', () => {
   assert.equal(removeJson.options?.[0]?.name, 'posicao');
   assert.equal(removeJson.options?.[0]?.required, true);
   assert.equal((removeJson.options?.[0] as { min_value?: number }).min_value, 1);
+
+  const moveJson = commandsByName.get('move')!.data.toJSON();
+  assert.equal(moveJson.options?.length, 2);
+  assert.equal(moveJson.options?.[0]?.name, 'origem');
+  assert.equal(moveJson.options?.[0]?.type, ApplicationCommandOptionType.Integer);
+  assert.equal(moveJson.options?.[0]?.required, true);
+  assert.equal((moveJson.options?.[0] as { min_value?: number }).min_value, 1);
+  assert.equal(moveJson.options?.[1]?.name, 'destino');
+  assert.equal(moveJson.options?.[1]?.type, ApplicationCommandOptionType.Integer);
+  assert.equal(moveJson.options?.[1]?.required, true);
+  assert.equal((moveJson.options?.[1] as { min_value?: number }).min_value, 1);
 
   const configJson = commandsByName.get('config')!.data.toJSON();
   assert.equal(
@@ -622,20 +656,31 @@ test('enforceCommandGuards validates voice membership, matching channel, and Vie
   }
 });
 
-test('enforceCommandGuards enforces canControlPlayer on all 9 control commands while allowing /play', async () => {
+test('enforceCommandGuards enforces canControlPlayer on all 10 control commands while allowing /play', async () => {
   const { context, settingsRepo, close } = makeTestContext();
   try {
     settingsRepo.update('guild-1', { djRoleId: 'role-dj' });
     const sharedVc = makeVoiceChannel({ id: 'vc-1', humanCount: 3, includeBot: true });
 
-    const controlCommands = ['pause', 'resume', 'skip', 'stop', 'shuffle', 'loop', 'volume', 'remove', 'clear'] as const;
+    const controlCommands = [
+      'pause',
+      'resume',
+      'skip',
+      'stop',
+      'shuffle',
+      'loop',
+      'volume',
+      'remove',
+      'move',
+      'clear',
+    ] as const;
     for (const cmdName of controlCommands) {
       const mock = makeInteraction({
         memberVoiceChannel: sharedVc,
         botVoiceChannel: sharedVc,
         memberRoleIds: [],
         memberPerms: [],
-        integers: { quantidade: 1, nivel: 50, posicao: 1 },
+        integers: { quantidade: 1, nivel: 50, posicao: 1, origem: 1, destino: 2 },
         strings: { modo: 'track' },
       });
       await commandsByName.get(cmdName)!.execute(mock.interaction, context);
@@ -682,10 +727,11 @@ test('enforceCommandGuards enforces canControlPlayer on all 9 control commands w
   }
 });
 
-test('/queue handles pagination buttons with 120_000ms collector and disables buttons on timeout', async () => {
+test('/queue handles pagination and smart action buttons with 120_000ms collector and disables all rows on timeout', async () => {
   const fake = makeFakeMusicService();
-  const { context, close } = makeTestContext(fake.service);
+  const { context, settingsRepo, close } = makeTestContext(fake.service);
   try {
+    settingsRepo.update('guild-1', { djRoleId: 'dj-role' });
     const mock = makeInteraction({
       channelId: 'tc-1',
       integers: { pagina: 1 },
@@ -694,6 +740,7 @@ test('/queue handles pagination buttons with 120_000ms collector and disables bu
     await commandsByName.get('queue')!.execute(mock.interaction, context);
 
     assert.equal(mock.replies.length, 1);
+    assert.ok(Array.isArray(mock.replies[0].components) && mock.replies[0].components.length === 2);
     assert.equal(mock.collectorOptionsList.length, 1);
     assert.equal(mock.collectorOptionsList[0].time, 120_000);
 
@@ -714,20 +761,108 @@ test('/queue handles pagination buttons with 120_000ms collector and disables bu
     const updatedEmbed = (updates[0].embeds as Array<{ toJSON: () => { footer?: { text?: string } } }>)[0].toJSON();
     assert.match(updatedEmbed.footer?.text ?? '', /Página 2 de 2/);
 
+    // Refresh stays on current page (2) without requiring voice
+    collector.emit('collect', {
+      customId: QUEUE_ACTION_IDS.refresh,
+      user: { id: 'user-1' },
+      update: async (payload: Record<string, unknown>) => {
+        updates.push(payload);
+      },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(updates.length, 2);
+    const refreshedEmbed = (updates[1].embeds as Array<{ toJSON: () => { footer?: { text?: string } } }>)[0].toJSON();
+    assert.match(refreshedEmbed.footer?.text ?? '', /Página 2 de 2/);
+
+    // Non-DJ user in crowded voice channel cannot shuffle from queue action row
+    const crowdedVc = makeVoiceChannel({ id: 'vc-1', humanCount: 3, includeBot: true });
+    const nonDjFollowUps: Array<Record<string, unknown>> = [];
+    const nonDjGuild = {
+      id: 'guild-1',
+      channels: { cache: new Map([[crowdedVc.id, crowdedVc]]) },
+      members: {
+        me: { id: 'bot-1', voice: { channelId: crowdedVc.id, channel: crowdedVc } },
+      },
+    };
+    collector.emit('collect', {
+      customId: QUEUE_ACTION_IDS.shuffle,
+      guildId: 'guild-1',
+      guild: nonDjGuild,
+      user: { id: 'user-2' },
+      member: {
+        id: 'user-2',
+        voice: { channelId: crowdedVc.id, channel: crowdedVc },
+        roles: { cache: new Map() },
+        permissions: new PermissionsBitField([]),
+      },
+      memberPermissions: new PermissionsBitField([]),
+      inGuild: () => true,
+      deferred: false,
+      replied: false,
+      reply: async (payload: Record<string, unknown>) => {
+        nonDjFollowUps.push(payload);
+      },
+      followUp: async (payload: Record<string, unknown>) => {
+        nonDjFollowUps.push(payload);
+      },
+      update: async (payload: Record<string, unknown>) => {
+        updates.push(payload);
+      },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(nonDjFollowUps.length, 1);
+    assert.equal(isEphemeral(nonDjFollowUps[0]), true);
+    assert.equal(fake.calls.some((c) => c.method === 'shuffle'), false);
+
+    // Authorized DJ user executes dedupe action cleanly
+    const djFollowUps: Array<Record<string, unknown>> = [];
+    collector.emit('collect', {
+      customId: QUEUE_ACTION_IDS.dedupe,
+      guildId: 'guild-1',
+      guild: nonDjGuild,
+      user: { id: 'dj-1' },
+      member: {
+        id: 'dj-1',
+        voice: { channelId: crowdedVc.id, channel: crowdedVc },
+        roles: { cache: new Map([['dj-role', { id: 'dj-role' }]]) },
+        permissions: new PermissionsBitField([]),
+      },
+      memberPermissions: new PermissionsBitField([]),
+      inGuild: () => true,
+      deferred: false,
+      replied: false,
+      reply: async (payload: Record<string, unknown>) => {
+        djFollowUps.push(payload);
+      },
+      followUp: async (payload: Record<string, unknown>) => {
+        djFollowUps.push(payload);
+      },
+      update: async (payload: Record<string, unknown>) => {
+        updates.push(payload);
+      },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(fake.calls.some((c) => c.method === 'removeDuplicates'), true);
+    assert.equal(updates.length, 3);
+    assert.equal(djFollowUps.length, 1);
+    assert.equal(isEphemeral(djFollowUps[0]), true);
+
     // Simulate collector timeout ('end')
     collector.emit('end', new Map(), 'time');
     await new Promise((r) => setTimeout(r, 10));
 
     assert.equal(mock.messageEdits.length, 1);
-    const disabledRow = (
-      mock.messageEdits[0].components as Array<{
-        toJSON: () => { components: Array<{ label?: string; disabled?: boolean }> };
-      }>
-    )[0].toJSON();
-    assert.equal(disabledRow.components.length, 2);
-    assert.equal(disabledRow.components[0].label, 'Anterior');
-    assert.equal(disabledRow.components[1].label, 'Próxima');
-    assert.equal(disabledRow.components.every((btn) => btn.disabled === true), true);
+    const disabledRows = mock.messageEdits[0].components as Array<{
+      toJSON: () => { components: Array<{ label?: string; disabled?: boolean }> };
+    }>;
+    assert.equal(disabledRows.length, 2);
+    const row1 = disabledRows[0].toJSON();
+    assert.equal(row1.components.length, 2);
+    assert.equal(row1.components[0].label, 'Anterior');
+    assert.equal(row1.components[1].label, 'Próxima');
+    for (const row of disabledRows) {
+      assert.equal(row.toJSON().components.every((btn) => btn.disabled === true), true);
+    }
   } finally {
     close();
   }
@@ -743,7 +878,7 @@ test('/nowplaying posts panel with control buttons and registers panel ref', asy
     assert.equal(mock.replies.length, 1);
     const reply = mock.replies[0];
     assert.ok(Array.isArray(reply.embeds) && reply.embeds.length === 1);
-    assert.ok(Array.isArray(reply.components) && reply.components.length === 1);
+    assert.ok(Array.isArray(reply.components) && reply.components.length === 2);
 
     const registerCall = fake.calls.find((c) => c.method === 'registerPanel');
     assert.ok(registerCall);
@@ -879,7 +1014,7 @@ test('deployCommands selects guild or global route based on DEV_GUILD_ID, --guil
   });
   assert.equal(r1.scope, 'guild');
   assert.equal(r1.route, '/applications/app-1/guilds/guild-dev/commands');
-  assert.equal(r1.commandCount, 13);
+  assert.equal(r1.commandCount, 14);
 
   // 2. --guild overrides DEV_GUILD_ID
   const r2 = await deployCommands({
@@ -912,7 +1047,7 @@ test('deployCommands selects guild or global route based on DEV_GUILD_ID, --guil
 
   assert.equal(putCalls.length, 4);
   for (const call of putCalls) {
-    assert.equal(call.body.length, 13);
+    assert.equal(call.body.length, 14);
   }
 
   // 5. --guild=<id> equals syntax works, and conflicting --global + --guild rejects
@@ -958,6 +1093,14 @@ test('music commands forward arguments, render clean embeds on success, and repl
       makeInteraction({ memberVoiceChannel: vc, botVoiceChannel: vc, integers: { posicao: 2 } }).interaction,
       context,
     );
+    await commandsByName.get('move')!.execute(
+      makeInteraction({
+        memberVoiceChannel: vc,
+        botVoiceChannel: vc,
+        integers: { origem: 3, destino: 1 },
+      }).interaction,
+      context,
+    );
     await commandsByName.get('clear')!.execute(
       makeInteraction({ memberVoiceChannel: vc, botVoiceChannel: vc }).interaction,
       context,
@@ -979,10 +1122,48 @@ test('music commands forward arguments, render clean embeds on success, and repl
     assert.deepEqual(fake.calls.find((c) => c.method === 'setLoop')?.args, ['guild-1', 'queue']);
     assert.deepEqual(fake.calls.find((c) => c.method === 'setVolume')?.args, ['guild-1', 120]);
     assert.deepEqual(fake.calls.find((c) => c.method === 'remove')?.args, ['guild-1', 2]);
+    assert.deepEqual(fake.calls.find((c) => c.method === 'moveTrack')?.args, ['guild-1', 3, 1]);
     assert.ok(fake.calls.some((c) => c.method === 'clearQueue'));
     assert.ok(fake.calls.some((c) => c.method === 'resume'));
     assert.ok(fake.calls.some((c) => c.method === 'shuffle'));
     assert.ok(fake.calls.some((c) => c.method === 'stop'));
+
+    // /play forwards proxima=true and displays Próxima da Fila + duplicate note
+    fake.service.play = async (...args: unknown[]) => {
+      fake.calls.push({ method: 'play', args });
+      return {
+        ok: true,
+        isPlaylist: false,
+        playlistName: null,
+        tracks: [],
+        firstTrack: {
+          info: {
+            title: 'Música Fura-Fila',
+            author: 'Banda X',
+            duration: 210_000,
+            uri: null,
+            artworkUrl: null,
+            isStream: false,
+          },
+        },
+        addedCount: 1,
+        truncatedCount: 0,
+        startedImmediately: false,
+        duplicateInQueue: true,
+        message: 'Adicionada como próxima da fila',
+      };
+    };
+    const playNextMock = makeInteraction({
+      memberVoiceChannel: vc,
+      strings: { busca: 'musica x' },
+      booleans: { proxima: true },
+    });
+    await commandsByName.get('play')!.execute(playNextMock.interaction, context);
+    const playNextCall = fake.calls.filter((c) => c.method === 'play').pop();
+    assert.equal((playNextCall?.args[0] as { playNext?: boolean })?.playNext, true);
+    const playNextEmbed = (playNextMock.edits[0].embeds as Array<{ toJSON: () => { title?: string; description?: string } }>)[0].toJSON();
+    assert.match(playNextEmbed.title ?? '', /Próxima da Fila/i);
+    assert.match(playNextEmbed.description ?? '', /já estava na fila/i);
 
     // Service errors reply ephemerally
     fake.service.pause = async () => ({

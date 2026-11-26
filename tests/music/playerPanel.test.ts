@@ -1,13 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { ButtonStyle } from 'discord.js';
 import {
   PANEL_BUTTON_IDS,
+  QUEUE_ACTION_IDS,
   QUEUE_BUTTON_PREFIX,
   PanelTracker,
   buildControlButtons,
   buildNowPlayingEmbed,
+  buildPanelComponents,
+  buildQueueActionButtons,
   buildQueueEmbed,
   buildQueuePaginationButtons,
+  buildVolumeControlButtons,
 } from '../../src/music/playerPanel.ts';
 
 test('buildControlButtons renders 5 pt-BR buttons reflecting pause, repeatMode, and disabled state', () => {
@@ -186,4 +191,179 @@ test('PanelTracker.disablePanelSafely swallows Discord Unknown Message (10008) a
     }));
   });
   assert.equal(tracker.getPanel('g-50001'), null);
+});
+
+test('buildNowPlayingEmbed renders live Discord countdown timestamp, paused badge, and volume emoji tiers', () => {
+  const baseNowMs = 1_700_000_000_000;
+  const playing = buildNowPlayingEmbed({
+    track: {
+      title: 'Timer Song',
+      author: 'Artist',
+      durationMs: 240_000,
+      positionMs: 60_000,
+      isStream: false,
+    },
+    paused: false,
+    volume: 120,
+    repeatMode: 'off',
+    nowMs: baseNowMs,
+  }).toJSON();
+
+  // remaining = 180s -> endsAt = 1_700_000_180
+  assert.match(playing.description ?? '', /termina <t:1700000180:R>/);
+  const playingVolume = playing.fields?.find((f) => f.name === 'Volume')?.value;
+  assert.equal(playingVolume, '🔊 120% (Boost)');
+
+  const paused = buildNowPlayingEmbed({
+    track: {
+      title: 'Timer Song',
+      author: 'Artist',
+      durationMs: 240_000,
+      positionMs: 60_000,
+      isStream: false,
+    },
+    paused: true,
+    volume: 0,
+    repeatMode: 'off',
+    nowMs: baseNowMs,
+  }).toJSON();
+
+  assert.match(paused.description ?? '', /• `Pausada`/);
+  assert.doesNotMatch(paused.description ?? '', /<t:/);
+  assert.equal(paused.fields?.find((f) => f.name === 'Volume')?.value, '🔇 0% (Mudo)');
+
+  const quiet = buildNowPlayingEmbed({
+    track: {
+      title: 'Quiet Song',
+      author: 'Artist',
+      durationMs: 120_000,
+      positionMs: 0,
+      isStream: false,
+    },
+    paused: false,
+    volume: 30,
+    repeatMode: 'off',
+  }).toJSON();
+  assert.equal(quiet.fields?.find((f) => f.name === 'Volume')?.value, '🔉 30%');
+});
+
+test('buildVolumeControlButtons, buildPanelComponents, and buildQueueActionButtons respect bounds and states', () => {
+  const mutedRow = buildVolumeControlButtons({ volume: 0 }).toJSON();
+  assert.equal(mutedRow.components.length, 4);
+  assert.deepEqual(
+    mutedRow.components.map((c) => ('custom_id' in c ? c.custom_id : undefined)),
+    [
+      PANEL_BUTTON_IDS.volumeDown,
+      PANEL_BUTTON_IDS.mute,
+      PANEL_BUTTON_IDS.volumeUp,
+      PANEL_BUTTON_IDS.queue,
+    ],
+  );
+  assert.equal(mutedRow.components[0].disabled, true);
+  assert.equal(mutedRow.components[1].disabled, false);
+  assert.equal('label' in mutedRow.components[1] ? mutedRow.components[1].label : undefined, '🔊 Desmutar');
+  assert.equal(mutedRow.components[1].style, ButtonStyle.Danger);
+  assert.equal(mutedRow.components[2].disabled, false);
+
+  const maxRow = buildVolumeControlButtons({ volume: 150 }).toJSON();
+  assert.equal(maxRow.components[0].disabled, false);
+  assert.equal('label' in maxRow.components[1] ? maxRow.components[1].label : undefined, '🔇 Mudo');
+  assert.equal(maxRow.components[1].style, ButtonStyle.Secondary);
+  assert.equal(maxRow.components[2].disabled, true);
+
+  const rows = buildPanelComponents({ paused: false, repeatMode: 'off', volume: 80 });
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].toJSON().components.length, 5);
+  assert.equal(rows[1].toJSON().components.length, 4);
+
+  const emptyQueueActions = buildQueueActionButtons({ hasTracks: false }).toJSON();
+  assert.deepEqual(
+    emptyQueueActions.components.map((c) => ('custom_id' in c ? c.custom_id : undefined)),
+    [
+      QUEUE_ACTION_IDS.refresh,
+      QUEUE_ACTION_IDS.shuffle,
+      QUEUE_ACTION_IDS.dedupe,
+      QUEUE_ACTION_IDS.clear,
+    ],
+  );
+  assert.equal(emptyQueueActions.components[0].disabled, false);
+  assert.equal(emptyQueueActions.components[1].disabled, true);
+  assert.equal(emptyQueueActions.components[2].disabled, true);
+  assert.equal(emptyQueueActions.components[3].disabled, true);
+
+  const populatedQueue = buildQueueEmbed({
+    currentTrack: {
+      title: 'Atual',
+      author: 'Artista',
+      durationMs: 180_000,
+      isStream: false,
+    },
+    currentPositionMs: 65_000,
+    queue: [
+      {
+        title: 'Próxima',
+        author: 'Artista 2',
+        durationMs: 90_000,
+        isStream: false,
+        requesterId: 'req-42',
+      },
+    ],
+    page: 1,
+    repeatMode: 'off',
+  }).toJSON();
+  assert.match(populatedQueue.description ?? '', /01:05 \/ 03:00/);
+  assert.match(populatedQueue.description ?? '', /<@req-42>/);
+});
+
+test('PanelTracker.updatePanelSafely edits active panels, clears on 10008, and preserves on transient errors', async () => {
+  const unexpectedErrors: unknown[] = [];
+  const tracker = new PanelTracker((err) => unexpectedErrors.push(err));
+  tracker.setPanel('g1', { channelId: 'c1', messageId: 'm1' });
+
+  const embed = buildNowPlayingEmbed({
+    track: { title: 'T', author: 'A', durationMs: 100_000, positionMs: 10_000, isStream: false },
+    paused: false,
+    volume: 80,
+    repeatMode: 'off',
+  });
+  const components = buildPanelComponents({ paused: false, repeatMode: 'off', volume: 80 });
+
+  let editCount = 0;
+  const ok = await tracker.updatePanelSafely(
+    'g1',
+    async () => ({
+      edit: async () => {
+        editCount += 1;
+      },
+    }),
+    { embeds: [embed], components },
+  );
+  assert.equal(ok, true);
+  assert.equal(editCount, 1);
+  assert.notEqual(tracker.getPanel('g1'), null);
+
+  // Transient non-ignored error keeps panel registered and reports via callback
+  const transientOk = await tracker.updatePanelSafely(
+    'g1',
+    async () => ({
+      edit: async () => {
+        throw new Error('502 Bad Gateway');
+      },
+    }),
+    { embeds: [embed], components },
+  );
+  assert.equal(transientOk, true);
+  assert.equal(unexpectedErrors.length, 1);
+  assert.notEqual(tracker.getPanel('g1'), null);
+
+  // Unknown Message (10008) cleans ref and returns false
+  const deletedOk = await tracker.updatePanelSafely(
+    'g1',
+    async () => {
+      throw Object.assign(new Error('Unknown Message'), { code: 10008 });
+    },
+    { embeds: [embed], components },
+  );
+  assert.equal(deletedOk, false);
+  assert.equal(tracker.getPanel('g1'), null);
 });

@@ -1,6 +1,7 @@
 import { clearCommand } from './clear.js';
 import { configCommand } from './config.js';
 import { loopCommand } from './loop.js';
+import { moveCommand } from './move.js';
 import { nowPlayingCommand } from './nowplaying.js';
 import { pauseCommand } from './pause.js';
 import { playCommand } from './play.js';
@@ -25,6 +26,7 @@ export const allCommands: readonly SlashCommand[] = [
   loopCommand,
   volumeCommand,
   removeCommand,
+  moveCommand,
   clearCommand,
   configCommand,
 ];
@@ -45,6 +47,7 @@ export {
   loopCommand,
   volumeCommand,
   removeCommand,
+  moveCommand,
   clearCommand,
   configCommand,
 };

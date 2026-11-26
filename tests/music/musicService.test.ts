@@ -76,9 +76,13 @@ class FakePlayer implements GatewayPlayer {
       return this.owner.tracks;
     },
     owner: null as unknown as FakePlayer,
-    add: async (item: GatewayTrack | GatewayTrack[]) => {
+    add: async (item: GatewayTrack | GatewayTrack[], index?: number) => {
       const items = Array.isArray(item) ? item : [item];
-      this.tracks.push(...items);
+      if (typeof index === 'number' && index >= 0 && index < this.tracks.length) {
+        this.tracks.splice(index, 0, ...items);
+      } else {
+        this.tracks.push(...items);
+      }
       return this.tracks.length;
     },
     shuffle: async () => {
@@ -89,8 +93,9 @@ class FakePlayer implements GatewayPlayer {
       }
       return this.tracks.length;
     },
-    splice: async (index: number, amount: number) => {
-      return this.tracks.splice(index, amount);
+    splice: async (index: number, amount: number, item?: GatewayTrack | GatewayTrack[]) => {
+      const insert = item === undefined ? [] : Array.isArray(item) ? item : [item];
+      return this.tracks.splice(index, amount, ...insert);
     },
   };
 
@@ -265,6 +270,7 @@ class FakeLavalinkGateway implements LavalinkGateway {
 class FakeGuildMessenger implements GuildMessenger {
   sentMessages: Array<{ channelId: string; content: string }> = [];
   sentPanels: Array<{ channelId: string; payload: NowPlayingPanelPayload; ref: PanelMessageRef }> = [];
+  updatedPanels: Array<{ messageId: string; payload: Record<string, unknown> }> = [];
   disabledMessages: string[] = [];
   messageStore = new Map<string, EditablePanelMessage>();
   nextMsgSeq = 1;
@@ -282,7 +288,14 @@ class FakeGuildMessenger implements GuildMessenger {
     this.sentPanels.push({ channelId, payload, ref });
     this.messageStore.set(messageId, {
       components: [buildControlButtons({ paused: payload.paused, repeatMode: payload.repeatMode })],
-      edit: async () => {
+      edit: async (editPayload) => {
+        if (editPayload && 'embeds' in editPayload && editPayload.embeds) {
+          this.updatedPanels.push({
+            messageId,
+            payload: editPayload as unknown as Record<string, unknown>,
+          });
+          return;
+        }
         this.disabledMessages.push(messageId);
       },
     });
@@ -294,7 +307,12 @@ class FakeGuildMessenger implements GuildMessenger {
   }
 }
 
-function createHarness(options?: { spotifyEnabled?: boolean; maxQueueSize?: number; rejoinStaggerMs?: number }) {
+function createHarness(options?: {
+  spotifyEnabled?: boolean;
+  maxQueueSize?: number;
+  rejoinStaggerMs?: number;
+  panelUpdateIntervalMs?: number;
+}) {
   const db = openDatabase(':memory:');
   const settingsRepo = new GuildSettingsRepository(db);
   const sessionStore = new SessionStoreRepository(db);
@@ -312,6 +330,7 @@ function createHarness(options?: { spotifyEnabled?: boolean; maxQueueSize?: numb
     spotifyEnabled: options?.spotifyEnabled ?? true,
     maxQueueSize: options?.maxQueueSize ?? 500,
     rejoinStaggerMs: options?.rejoinStaggerMs,
+    panelUpdateIntervalMs: options?.panelUpdateIntervalMs ?? 0,
   });
 
   return { db, settingsRepo, sessionStore, queueStore, gateway, messenger, service };
@@ -1122,6 +1141,252 @@ test('handleNodeResumed cleans stale panel and schedules auto-leave for idle non
   assert.equal(gateway.getPlayer('g-idle-off'), null);
   assert.ok(gateway.destroyCalls.some((c) => c.guildId === 'g-idle-off' && c.reason === 'autoLeave'));
   assert.notEqual(gateway.getPlayer('g-idle-247'), null);
+
+  await service.shutdownGracefully();
+  db.close();
+});
+
+test('live panel updater ticks while playing, skips paused/stream tracks, and stops cleanly on pause/queueEnd/shutdown', async () => {
+  const { db, gateway, messenger, service } = createHarness({ panelUpdateIntervalMs: 25 });
+  const player = await gateway.createPlayer({
+    guildId: 'g-live',
+    voiceChannelId: 'vc-1',
+    textChannelId: 'tc-1',
+    volume: 80,
+  });
+  await player.connect();
+  const track = makeTrack('live-1', 'Música Ao Vivo no Timer', 240_000);
+  player.current = track;
+  player.playing = true;
+  player.position = 30_000;
+
+  await service.handleTrackStart('g-live', track);
+  assert.equal(messenger.sentPanels.length, 1);
+
+  await delay(65);
+  const countWhilePlaying = messenger.updatedPanels.length;
+  assert.ok(countWhilePlaying >= 1, `Expected live panel updates, got ${countWhilePlaying}`);
+  const lastUpdatedEmbed = (
+    messenger.updatedPanels[messenger.updatedPanels.length - 1].payload.embeds as Array<{
+      toJSON: () => { description?: string };
+    }>
+  )[0].toJSON();
+  assert.match(lastUpdatedEmbed.description ?? '', /00:30/);
+
+  // Pausing refreshes immediately once, then stops ticking while paused
+  await service.pause('g-live');
+  await delay(10);
+  const countAfterPause = messenger.updatedPanels.length;
+  await delay(65);
+  assert.equal(messenger.updatedPanels.length, countAfterPause);
+
+  // Stream tracks do not trigger background ticks
+  await service.resume('g-live');
+  player.current = {
+    ...track,
+    info: { ...track.info, isStream: true, duration: 0 },
+  };
+  await delay(10);
+  const countAtStreamStart = messenger.updatedPanels.length;
+  await delay(65);
+  assert.equal(messenger.updatedPanels.length, countAtStreamStart);
+
+  // queueEnd stops updater and disables panel
+  await service.handleQueueEnd('g-live');
+  assert.equal(messenger.disabledMessages.length, 1);
+  const countAfterEnd = messenger.updatedPanels.length;
+  await delay(50);
+  assert.equal(messenger.updatedPanels.length, countAfterEnd);
+
+  await service.shutdownGracefully();
+  db.close();
+});
+
+test('adjustVolume clamps 0..150 and toggleMute saves/restores previous volume with defaultVolume fallback', async () => {
+  const { db, settingsRepo, gateway, service } = createHarness();
+  settingsRepo.update('g-vol', { defaultVolume: 65 });
+
+  const player = await gateway.createPlayer({
+    guildId: 'g-vol',
+    voiceChannelId: 'vc-1',
+    textChannelId: 'tc-1',
+    volume: 65,
+  });
+  player.current = makeTrack('v1');
+  player.playing = true;
+
+  // Adjust up/down clamping
+  const up = await service.adjustVolume('g-vol', 100);
+  assert.equal(up.ok, true);
+  if (up.ok) assert.equal(up.volume, 150);
+
+  const down = await service.adjustVolume('g-vol', -20);
+  assert.equal(down.ok, true);
+  if (down.ok) assert.equal(down.volume, 130);
+
+  // Toggle mute saves 130 -> 0 -> restores 130
+  const muteRes = await service.toggleMute('g-vol');
+  assert.equal(muteRes.ok, true);
+  if (muteRes.ok) {
+    assert.equal(muteRes.volume, 0);
+    assert.equal(muteRes.muted, true);
+  }
+  assert.equal(player.volume, 0);
+
+  const unmuteRes = await service.toggleMute('g-vol');
+  assert.equal(unmuteRes.ok, true);
+  if (unmuteRes.ok) {
+    assert.equal(unmuteRes.volume, 130);
+    assert.equal(unmuteRes.muted, false);
+  }
+  assert.equal(player.volume, 130);
+
+  // Clamp to 0 via adjustVolume also saves prior volume for unmute
+  await service.setVolume('g-vol', 15);
+  const clampedZero = await service.adjustVolume('g-vol', -20);
+  assert.equal(clampedZero.ok, true);
+  if (clampedZero.ok) assert.equal(clampedZero.volume, 0);
+  const restoredFromClamp = await service.toggleMute('g-vol');
+  assert.equal(restoredFromClamp.ok, true);
+  if (restoredFromClamp.ok) assert.equal(restoredFromClamp.volume, 15);
+
+  // If player stopped cleanly, previous mute memory clears; fallback uses settings.defaultVolume
+  await service.stop('g-vol');
+  const freshMutedPlayer = await gateway.createPlayer({
+    guildId: 'g-vol',
+    voiceChannelId: 'vc-1',
+    textChannelId: 'tc-1',
+    volume: 0,
+  });
+  const fallbackUnmute = await service.toggleMute('g-vol');
+  assert.equal(fallbackUnmute.ok, true);
+  if (fallbackUnmute.ok) assert.equal(fallbackUnmute.volume, 65);
+  assert.equal(freshMutedPlayer.volume, 65);
+
+  await service.shutdownGracefully();
+  db.close();
+});
+
+test('smart queue supports playNext, duplicate detection, moveTrack, removeDuplicates, and currentPositionMs snapshot', async () => {
+  const { db, gateway, service } = createHarness();
+
+  const tracksByQuery: Record<string, GatewayTrack> = {
+    a: makeTrack('id-a', 'Track A'),
+    b: makeTrack('id-b', 'Track B'),
+    c: makeTrack('id-c', 'Track C'),
+  };
+  gateway.searchHandler = (q) => ({
+    loadType: 'track',
+    tracks: [tracksByQuery[q.query] ?? makeTrack('id-x', q.query)],
+    playlist: null,
+    exception: null,
+  });
+
+  // 1. Start A, queue B, queue duplicate B (detects duplicate), then playNext C (inserts at index 0)
+  const playA = await service.play({
+    guildId: 'g-q',
+    voiceChannelId: 'vc-1',
+    textChannelId: 'tc-1',
+    query: 'a',
+    requester: { id: 'u1' },
+  });
+  assert.equal(playA.ok, true);
+  if (playA.ok) assert.equal(playA.duplicateInQueue, false);
+
+  const playB = await service.play({
+    guildId: 'g-q',
+    voiceChannelId: 'vc-1',
+    textChannelId: 'tc-1',
+    query: 'b',
+    requester: { id: 'u1' },
+  });
+  assert.equal(playB.ok, true);
+  if (playB.ok) assert.equal(playB.duplicateInQueue, false);
+
+  const playBDup = await service.play({
+    guildId: 'g-q',
+    voiceChannelId: 'vc-1',
+    textChannelId: 'tc-1',
+    query: 'b',
+    requester: { id: 'u2' },
+  });
+  assert.equal(playBDup.ok, true);
+  if (playBDup.ok) {
+    assert.equal(playBDup.duplicateInQueue, true);
+    assert.match(playBDup.message, /já estava na fila/i);
+  }
+
+  const playADup = await service.play({
+    guildId: 'g-q',
+    voiceChannelId: 'vc-1',
+    textChannelId: 'tc-1',
+    query: 'a',
+    requester: { id: 'u3' },
+  });
+  assert.equal(playADup.ok, true);
+  if (playADup.ok) assert.equal(playADup.duplicateInQueue, true);
+
+  const playCNext = await service.play({
+    guildId: 'g-q',
+    voiceChannelId: 'vc-1',
+    textChannelId: 'tc-1',
+    query: 'c',
+    requester: { id: 'u1' },
+    playNext: true,
+  });
+  assert.equal(playCNext.ok, true);
+  if (playCNext.ok) {
+    assert.match(playCNext.message, /próxima da fila/i);
+  }
+
+  const player = gateway.getPlayer('g-q')!;
+  player.position = 42_000;
+  // Current is A; queue should now be [C, B, B, A]
+  assert.deepEqual(
+    player.tracks.map((t) => t.info.identifier),
+    ['id-c', 'id-b', 'id-b', 'id-a'],
+  );
+
+  // getQueue returns currentPositionMs
+  const snapshot = service.getQueue('g-q')!;
+  assert.equal(snapshot.currentPositionMs, 42_000);
+
+  // 2. moveTrack validation & movement (move pos 4 'id-a' -> pos 2)
+  const samePos = await service.moveTrack('g-q', 2, 2);
+  assert.equal(samePos.ok, false);
+  const outRange = await service.moveTrack('g-q', 1, 9);
+  assert.equal(outRange.ok, false);
+
+  const movedBack = await service.moveTrack('g-q', 4, 2);
+  assert.equal(movedBack.ok, true);
+  assert.deepEqual(
+    player.tracks.map((t) => t.info.identifier),
+    ['id-c', 'id-a', 'id-b', 'id-b'],
+  );
+
+  const movedToEnd = await service.moveTrack('g-q', 1, 4);
+  assert.equal(movedToEnd.ok, true);
+  assert.deepEqual(
+    player.tracks.map((t) => t.info.identifier),
+    ['id-a', 'id-b', 'id-b', 'id-c'],
+  );
+
+  // 3. removeDuplicates removes 'id-a' (matches currentTrack) and second 'id-b'
+  const deduped = await service.removeDuplicates('g-q');
+  assert.equal(deduped.ok, true);
+  if (deduped.ok) {
+    assert.equal(deduped.removedCount, 2);
+  }
+  assert.deepEqual(
+    player.tracks.map((t) => t.info.identifier),
+    ['id-b', 'id-c'],
+  );
+
+  const noDups = await service.removeDuplicates('g-q');
+  assert.equal(noDups.ok, true);
+  if (noDups.ok) {
+    assert.equal(noDups.removedCount, 0);
+  }
 
   await service.shutdownGracefully();
   db.close();

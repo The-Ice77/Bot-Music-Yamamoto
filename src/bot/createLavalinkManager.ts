@@ -177,10 +177,13 @@ export function createLavalinkManager(deps: CreateLavalinkManagerDeps): Lavalink
         }
         return player.queue.tracks as unknown as readonly GatewayTrack[];
       },
-      add: (tracks: GatewayTrack | GatewayTrack[]) =>
-        player.queue.add(tracks as unknown as Track | Track[]),
+      add: (tracks: GatewayTrack | GatewayTrack[], index?: number) =>
+        player.queue.add(tracks as unknown as Track | Track[], index),
       shuffle: () => player.queue.shuffle(),
-      splice: (index: number, amount: number) => player.queue.splice(index, amount),
+      splice: (index: number, amount: number, tracks?: GatewayTrack | GatewayTrack[]) =>
+        tracks === undefined
+          ? player.queue.splice(index, amount)
+          : player.queue.splice(index, amount, tracks as unknown as Track | Track[]),
     };
 
     return {

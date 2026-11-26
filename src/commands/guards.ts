@@ -3,18 +3,20 @@ import {
   EmbedBuilder,
   MessageFlags,
   PermissionFlagsBits,
+  type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Guild,
   type GuildBasedChannel,
   type GuildMember,
   type VoiceBasedChannel,
 } from 'discord.js';
-import type { GuildSettings } from '../db/guildSettingsRepository.js';
+import type { GuildSettings, GuildSettingsRepository } from '../db/guildSettingsRepository.js';
 import {
   canControlPlayer,
   validateMusicChannel,
   validateVoiceAccess,
 } from '../music/permissions.js';
+import type { AppLogger } from '../utils/logger.js';
 import type { CommandContext } from './types.js';
 
 export const COMMAND_EMBED_COLOR = 0x5865f2;
@@ -41,6 +43,15 @@ export type GuardResult =
     }
   | { ok: false };
 
+export type ButtonControlGuardResult =
+  | {
+      ok: true;
+      guild: Guild;
+      guildId: string;
+      member: GuildMember;
+    }
+  | { ok: false };
+
 export interface BotVoicePermsCheck {
   ok: boolean;
   missing: string[];
@@ -48,8 +59,9 @@ export interface BotVoicePermsCheck {
 }
 
 type VoiceChannelLike = Pick<VoiceBasedChannel, 'id' | 'type' | 'permissionsFor' | 'members'>;
+type GuildInteractionLike = ChatInputCommandInteraction | ButtonInteraction;
 
-function resolveGuildMember(interaction: ChatInputCommandInteraction, guild: Guild): GuildMember | null {
+function resolveGuildMember(interaction: GuildInteractionLike, guild: Guild): GuildMember | null {
   const raw = interaction.member;
   if (raw && typeof raw === 'object' && 'voice' in raw) {
     return raw as GuildMember;
@@ -58,14 +70,14 @@ function resolveGuildMember(interaction: ChatInputCommandInteraction, guild: Gui
 }
 
 function resolveMemberPermissions(
-  interaction: ChatInputCommandInteraction,
+  interaction: GuildInteractionLike,
   member: GuildMember,
 ) {
   return interaction.memberPermissions ?? member.permissions;
 }
 
 function hasManageGuildPermission(
-  interaction: ChatInputCommandInteraction,
+  interaction: GuildInteractionLike,
   member: GuildMember,
 ): boolean {
   const perms = resolveMemberPermissions(interaction, member);
@@ -73,7 +85,7 @@ function hasManageGuildPermission(
 }
 
 function hasAdminOrManagerPermission(
-  interaction: ChatInputCommandInteraction,
+  interaction: GuildInteractionLike,
   member: GuildMember,
 ): boolean {
   const perms = resolveMemberPermissions(interaction, member);
@@ -331,4 +343,92 @@ export async function enforceCommandGuards(
     settings,
     voiceChannelId: memberVoice.channelId,
   };
+}
+
+async function safeReplyButtonEphemeral(
+  interaction: ButtonInteraction,
+  content: string,
+  logger: AppLogger,
+): Promise<void> {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+  } catch (error) {
+    logger.warn(
+      { err: error, guildId: interaction.guildId, userId: interaction.user?.id },
+      'Falha ao enviar resposta efêmera para interação',
+    );
+  }
+}
+
+/**
+ * Enforces guild context, same voice channel as the bot, and `canControlPlayer`
+ * permissions for interactive player/queue button controls.
+ */
+export async function enforceButtonControl(
+  interaction: ButtonInteraction,
+  settingsRepo: GuildSettingsRepository,
+  logger: AppLogger,
+): Promise<ButtonControlGuardResult> {
+  const guild = interaction.guild;
+  const guildId = interaction.guildId;
+  if ((typeof interaction.inGuild === 'function' && !interaction.inGuild()) || !guild || !guildId) {
+    await safeReplyButtonEphemeral(
+      interaction,
+      'Este controle só pode ser usado dentro de um servidor.',
+      logger,
+    );
+    return { ok: false };
+  }
+
+  const member = resolveGuildMember(interaction, guild);
+  if (!member) {
+    await safeReplyButtonEphemeral(
+      interaction,
+      'Não foi possível identificar seu membro neste servidor.',
+      logger,
+    );
+    return { ok: false };
+  }
+
+  const memberVoice = resolveVoiceChannel(guild, member.voice);
+  if (!memberVoice.channelId) {
+    await safeReplyButtonEphemeral(
+      interaction,
+      'Você precisa estar conectado a um canal de voz para usar os controles do player.',
+      logger,
+    );
+    return { ok: false };
+  }
+
+  const botVoice = resolveVoiceChannel(guild, guild.members?.me?.voice);
+  if (botVoice.channelId !== null && botVoice.channelId !== memberVoice.channelId) {
+    await safeReplyButtonEphemeral(
+      interaction,
+      `Você precisa estar no mesmo canal de voz que eu (<#${botVoice.channelId}>) para usar os controles.`,
+      logger,
+    );
+    return { ok: false };
+  }
+
+  const settings = settingsRepo.getOrDefault(guildId);
+  const allowed = canControlPlayer({
+    djRoleId: settings.djRoleId,
+    memberRoleIds: extractMemberRoleIds(member),
+    isAdminOrManager: hasAdminOrManagerPermission(interaction, member),
+    humanCountInBotChannel: countHumansInChannel(botVoice.channel ?? memberVoice.channel),
+  });
+
+  if (!allowed) {
+    const message = settings.djRoleId
+      ? `Você precisa do cargo <@&${settings.djRoleId}> (DJ), permissão de administrador/gerenciar servidor ou estar sozinho com o bot no canal de voz para usar os controles.`
+      : 'Você não tem permissão para controlar o player no momento.';
+    await safeReplyButtonEphemeral(interaction, message, logger);
+    return { ok: false };
+  }
+
+  return { ok: true, guild, guildId, member };
 }

@@ -1,5 +1,5 @@
 import { InteractionContextType, SlashCommandBuilder } from 'discord.js';
-import { buildControlButtons, buildNowPlayingEmbed } from '../music/playerPanel.js';
+import { buildNowPlayingEmbed, buildPanelComponents } from '../music/playerPanel.js';
 import { enforceCommandGuards, replyEphemeral } from './guards.js';
 import type { SlashCommand } from './types.js';
 
@@ -28,14 +28,15 @@ export const nowPlayingCommand: SlashCommand = {
       repeatMode: snapshot.repeatMode,
       queueLength: snapshot.queueLength,
     });
-    const row = buildControlButtons({
+    const components = buildPanelComponents({
       paused: snapshot.paused,
       repeatMode: snapshot.repeatMode,
+      volume: snapshot.volume,
     });
 
     const response = await interaction.reply({
       embeds: [embed],
-      components: [row],
+      components,
     });
 
     const fetched =

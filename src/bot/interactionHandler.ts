@@ -1,65 +1,29 @@
 import {
   MessageFlags,
-  PermissionFlagsBits,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
-  type Guild,
-  type GuildMember,
   type Interaction,
 } from 'discord.js';
-import { resolveVoiceChannel } from '../commands/guards.js';
+import { enforceButtonControl, resolveVoiceChannel } from '../commands/guards.js';
 import { commandsByName } from '../commands/index.js';
 import type { CommandContext, SlashCommand } from '../commands/types.js';
-import { canControlPlayer } from '../music/permissions.js';
 import {
   PANEL_BUTTON_IDS,
+  QUEUE_ACTION_PREFIX,
   QUEUE_BUTTON_PREFIX,
-  buildControlButtons,
   buildNowPlayingEmbed,
+  buildPanelComponents,
+  buildQueueEmbed,
   disableMessageButtonsSafely,
   type EditablePanelMessage,
 } from '../music/playerPanel.js';
 import type { AppLogger } from '../utils/logger.js';
-import { countHumansInVoiceChannel } from './voiceStateHandler.js';
 
 export interface InteractionHandlerDeps extends CommandContext {
   commands?: ReadonlyMap<string, SlashCommand>;
 }
 
 const PANEL_BUTTON_ID_SET = new Set<string>(Object.values(PANEL_BUTTON_IDS));
-
-function resolveMember(
-  interaction: ButtonInteraction,
-  guild: Guild,
-): GuildMember | null {
-  const raw = interaction.member;
-  if (raw && typeof raw === 'object' && 'voice' in raw) {
-    return raw as GuildMember;
-  }
-  return guild.members?.cache?.get(interaction.user.id) ?? null;
-}
-
-function extractRoleIds(member: GuildMember): readonly string[] | ReadonlySet<string> {
-  const roles = member.roles as unknown;
-  if (Array.isArray(roles)) {
-    return roles as string[];
-  }
-  if (roles && typeof roles === 'object' && 'cache' in roles) {
-    const cache = (roles as { cache?: Map<string, unknown> }).cache;
-    if (cache && typeof cache.keys === 'function') {
-      return new Set(cache.keys());
-    }
-  }
-  return [];
-}
-
-function isAdminOrManager(interaction: ButtonInteraction, member: GuildMember): boolean {
-  const perms = interaction.memberPermissions ?? member.permissions;
-  return Boolean(
-    perms?.has?.(PermissionFlagsBits.Administrator) ||
-      perms?.has?.(PermissionFlagsBits.ManageGuild),
-  );
-}
 
 async function safeReplyEphemeral(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
@@ -170,16 +134,6 @@ async function handlePanelButton(
     return;
   }
 
-  const member = resolveMember(interaction, guild);
-  if (!member) {
-    await safeReplyEphemeral(
-      interaction,
-      'Não foi possível identificar seu membro neste servidor.',
-      deps.logger,
-    );
-    return;
-  }
-
   const botVoice = resolveVoiceChannel(guild, guild.members?.me?.voice);
   if (botVoice.channelId === null && !deps.musicService.getNowPlaying(guildId)) {
     await safeReplyEphemeral(
@@ -191,38 +145,38 @@ async function handlePanelButton(
     return;
   }
 
-  const memberVoice = resolveVoiceChannel(guild, member.voice);
-  if (!memberVoice.channelId) {
-    await safeReplyEphemeral(
-      interaction,
-      'Você precisa estar conectado a um canal de voz para usar os controles do player.',
-      deps.logger,
-    );
+  if (interaction.customId === PANEL_BUTTON_IDS.queue) {
+    const queueSnapshot = deps.musicService.getQueue(guildId);
+    if (!queueSnapshot) {
+      await safeReplyEphemeral(
+        interaction,
+        'Não há nenhuma música tocando ou na fila no momento.',
+        deps.logger,
+      );
+      return;
+    }
+
+    try {
+      const embed = buildQueueEmbed({
+        currentTrack: queueSnapshot.currentTrack,
+        currentPositionMs: queueSnapshot.currentPositionMs,
+        queue: queueSnapshot.queue,
+        page: 1,
+        repeatMode: queueSnapshot.repeatMode,
+        paused: queueSnapshot.paused,
+      });
+      await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    } catch (error) {
+      deps.logger.warn(
+        { err: error, guildId, userId: interaction.user?.id },
+        'Falha ao exibir fila rápida do painel',
+      );
+    }
     return;
   }
 
-  if (botVoice.channelId !== null && botVoice.channelId !== memberVoice.channelId) {
-    await safeReplyEphemeral(
-      interaction,
-      `Você precisa estar no mesmo canal de voz que eu (<#${botVoice.channelId}>) para usar os controles.`,
-      deps.logger,
-    );
-    return;
-  }
-
-  const settings = deps.settingsRepo.getOrDefault(guildId);
-  const allowed = canControlPlayer({
-    djRoleId: settings.djRoleId,
-    memberRoleIds: extractRoleIds(member),
-    isAdminOrManager: isAdminOrManager(interaction, member),
-    humanCountInBotChannel: countHumansInVoiceChannel(botVoice.channel ?? memberVoice.channel),
-  });
-
-  if (!allowed) {
-    const message = settings.djRoleId
-      ? `Você precisa do cargo <@&${settings.djRoleId}> (DJ), permissão de administrador/gerenciar servidor ou estar sozinho com o bot no canal de voz para usar os controles.`
-      : 'Você não tem permissão para controlar o player no momento.';
-    await safeReplyEphemeral(interaction, message, deps.logger);
+  const controlGuard = await enforceButtonControl(interaction, deps.settingsRepo, deps.logger);
+  if (!controlGuard.ok) {
     return;
   }
 
@@ -230,6 +184,13 @@ async function handlePanelButton(
     interaction.customId === PANEL_BUTTON_IDS.skip ||
     interaction.customId === PANEL_BUTTON_IDS.shuffle ||
     interaction.customId === PANEL_BUTTON_IDS.stop;
+
+  const isUpdateControl =
+    interaction.customId === PANEL_BUTTON_IDS.toggle ||
+    interaction.customId === PANEL_BUTTON_IDS.loop ||
+    interaction.customId === PANEL_BUTTON_IDS.volumeDown ||
+    interaction.customId === PANEL_BUTTON_IDS.volumeUp ||
+    interaction.customId === PANEL_BUTTON_IDS.mute;
 
   let deferredByUs = false;
   try {
@@ -262,6 +223,15 @@ async function handlePanelButton(
       case PANEL_BUTTON_IDS.stop:
         result = await deps.musicService.stop(guildId);
         break;
+      case PANEL_BUTTON_IDS.volumeDown:
+        result = await deps.musicService.adjustVolume(guildId, -10);
+        break;
+      case PANEL_BUTTON_IDS.volumeUp:
+        result = await deps.musicService.adjustVolume(guildId, 10);
+        break;
+      case PANEL_BUTTON_IDS.mute:
+        result = await deps.musicService.toggleMute(guildId);
+        break;
       default:
         return;
     }
@@ -274,10 +244,7 @@ async function handlePanelButton(
       return;
     }
 
-    if (
-      interaction.customId === PANEL_BUTTON_IDS.toggle ||
-      interaction.customId === PANEL_BUTTON_IDS.loop
-    ) {
+    if (isUpdateControl) {
       const snapshot = deps.musicService.getNowPlaying(guildId);
       if (snapshot && typeof interaction.update === 'function') {
         await interaction.update({
@@ -290,12 +257,11 @@ async function handlePanelButton(
               queueLength: snapshot.queueLength,
             }),
           ],
-          components: [
-            buildControlButtons({
-              paused: snapshot.paused,
-              repeatMode: snapshot.repeatMode,
-            }),
-          ],
+          components: buildPanelComponents({
+            paused: snapshot.paused,
+            repeatMode: snapshot.repeatMode,
+            volume: snapshot.volume,
+          }),
         });
         return;
       }
@@ -340,7 +306,7 @@ async function handlePanelButton(
 
 /**
  * Dispatches Discord slash commands and `music:*` interactive player panel buttons.
- * Leaves `queue:page:` pagination buttons to `/queue`'s dedicated component collector.
+ * Leaves `queue:page:` and `queue:action:` buttons to `/queue`'s dedicated component collector.
  */
 export async function handleInteraction(
   interaction: Interaction,
@@ -352,7 +318,10 @@ export async function handleInteraction(
   }
 
   if (interaction.isButton()) {
-    if (interaction.customId.startsWith(QUEUE_BUTTON_PREFIX)) {
+    if (
+      interaction.customId.startsWith(QUEUE_BUTTON_PREFIX) ||
+      interaction.customId.startsWith(QUEUE_ACTION_PREFIX)
+    ) {
       return;
     }
     if (!PANEL_BUTTON_ID_SET.has(interaction.customId)) {

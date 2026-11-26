@@ -15,9 +15,21 @@ export const PANEL_BUTTON_IDS = {
   loop: 'music:loop',
   shuffle: 'music:shuffle',
   stop: 'music:stop',
+  volumeDown: 'music:vol_down',
+  mute: 'music:mute',
+  volumeUp: 'music:vol_up',
+  queue: 'music:queue',
 } as const;
 
 export const QUEUE_BUTTON_PREFIX = 'queue:page:' as const;
+export const QUEUE_ACTION_PREFIX = 'queue:action:' as const;
+
+export const QUEUE_ACTION_IDS = {
+  refresh: `${QUEUE_ACTION_PREFIX}refresh`,
+  shuffle: `${QUEUE_ACTION_PREFIX}shuffle`,
+  dedupe: `${QUEUE_ACTION_PREFIX}dedupe`,
+  clear: `${QUEUE_ACTION_PREFIX}clear`,
+} as const;
 
 const EMBED_COLOR_PLAYING = 0x1db954;
 const EMBED_COLOR_PAUSED = 0xf59e0b;
@@ -43,6 +55,7 @@ export interface NowPlayingEmbedOptions {
   volume: number;
   repeatMode: RepeatMode;
   queueLength?: number;
+  nowMs?: number;
 }
 
 export interface ControlButtonsOptions {
@@ -68,6 +81,7 @@ export interface QueueEmbedOptions {
   pageSize?: number;
   repeatMode: RepeatMode;
   paused?: boolean;
+  currentPositionMs?: number;
 }
 
 export interface QueuePaginationOptions {
@@ -92,7 +106,10 @@ interface ActionRowLike {
 
 export interface EditablePanelMessage {
   components?: readonly ActionRowLike[];
-  edit(payload: { components: ActionRowBuilder<ButtonBuilder>[] }): Promise<unknown>;
+  edit(payload: {
+    embeds?: EmbedBuilder[];
+    components?: ActionRowBuilder<ButtonBuilder>[];
+  }): Promise<unknown>;
 }
 
 export type PanelMessageFetcher = (
@@ -119,6 +136,19 @@ function formatRepeatFieldValue(repeatMode: RepeatMode): string {
     default:
       return 'Desativado';
   }
+}
+
+function formatVolumeFieldValue(volume: number): string {
+  if (volume <= 0) {
+    return '🔇 0% (Mudo)';
+  }
+  if (volume < 50) {
+    return `🔉 ${volume}%`;
+  }
+  if (volume > 100) {
+    return `🔊 ${volume}% (Boost)`;
+  }
+  return `🔊 ${volume}%`;
 }
 
 function formatTrackLink(title: string, uri?: string | null): string {
@@ -174,11 +204,26 @@ function buildDisabledRowsFromMessage(message: EditablePanelMessage): ActionRowB
  * Builds the `pt-BR` Now Playing embed for the active track and player state.
  */
 export function buildNowPlayingEmbed(options: NowPlayingEmbedOptions): EmbedBuilder {
-  const { track, paused, volume, repeatMode, queueLength } = options;
+  const { track, paused, volume, repeatMode, queueLength, nowMs } = options;
 
-  const progressLine = track.isStream
+  const baseProgressLine = track.isStream
     ? '`AO VIVO`'
     : `\`${formatDuration(track.positionMs)}\` ${buildProgressBar(track.positionMs, track.durationMs)} \`${formatDuration(track.durationMs)}\``;
+
+  let progressSuffix = '';
+  if (!track.isStream) {
+    if (paused) {
+      progressSuffix = ' • `Pausada`';
+    } else if (track.durationMs > 0) {
+      const remainingMs = Math.max(0, track.durationMs - Math.max(0, track.positionMs));
+      if (remainingMs > 0) {
+        const endsAtSeconds = Math.floor(((nowMs ?? Date.now()) + remainingMs) / 1000);
+        progressSuffix = ` • termina <t:${endsAtSeconds}:R>`;
+      }
+    }
+  }
+
+  const progressLine = `${baseProgressLine}${progressSuffix}`;
 
   const embed = new EmbedBuilder()
     .setColor(paused ? EMBED_COLOR_PAUSED : EMBED_COLOR_PLAYING)
@@ -194,7 +239,7 @@ export function buildNowPlayingEmbed(options: NowPlayingEmbedOptions): EmbedBuil
       },
       {
         name: 'Volume',
-        value: `${volume}%`,
+        value: formatVolumeFieldValue(volume),
         inline: true,
       },
       {
@@ -262,14 +307,92 @@ export function buildControlButtons(options: ControlButtonsOptions): ActionRowBu
 }
 
 /**
+ * Builds the 4-button volume and quick-queue secondary row in `pt-BR`.
+ */
+export function buildVolumeControlButtons(options: {
+  volume: number;
+  disabled?: boolean;
+}): ActionRowBuilder<ButtonBuilder> {
+  const disabled = Boolean(options.disabled);
+  const isMuted = options.volume <= 0;
+
+  const volDownButton = new ButtonBuilder()
+    .setCustomId(PANEL_BUTTON_IDS.volumeDown)
+    .setLabel('🔉 -10%')
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(disabled || options.volume <= 0);
+
+  const muteButton = new ButtonBuilder()
+    .setCustomId(PANEL_BUTTON_IDS.mute)
+    .setLabel(isMuted ? '🔊 Desmutar' : '🔇 Mudo')
+    .setStyle(isMuted ? ButtonStyle.Danger : ButtonStyle.Secondary)
+    .setDisabled(disabled);
+
+  const volUpButton = new ButtonBuilder()
+    .setCustomId(PANEL_BUTTON_IDS.volumeUp)
+    .setLabel('🔊 +10%')
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(disabled || options.volume >= 150);
+
+  const queueButton = new ButtonBuilder()
+    .setCustomId(PANEL_BUTTON_IDS.queue)
+    .setLabel('📜 Fila')
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(disabled);
+
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    volDownButton,
+    muteButton,
+    volUpButton,
+    queueButton,
+  );
+}
+
+/**
+ * Builds both interactive action rows (playback + volume/queue) for the Now Playing panel.
+ */
+export function buildPanelComponents(options: {
+  paused: boolean;
+  repeatMode: RepeatMode;
+  volume: number;
+  disabled?: boolean;
+}): ActionRowBuilder<ButtonBuilder>[] {
+  return [
+    buildControlButtons({
+      paused: options.paused,
+      repeatMode: options.repeatMode,
+      disabled: options.disabled,
+    }),
+    buildVolumeControlButtons({
+      volume: options.volume,
+      disabled: options.disabled,
+    }),
+  ];
+}
+
+/**
  * Builds the paginated `pt-BR` queue embed showing the current track and upcoming tracks.
  */
 export function buildQueueEmbed(options: QueueEmbedOptions): EmbedBuilder {
-  const { currentTrack, queue, page, pageSize = 10, repeatMode, paused = false } = options;
+  const {
+    currentTrack,
+    queue,
+    page,
+    pageSize = 10,
+    repeatMode,
+    paused = false,
+    currentPositionMs,
+  } = options;
   const paginated = paginateQueue(queue, page, pageSize);
 
+  const currentDurationLabel = currentTrack
+    ? !currentTrack.isStream && typeof currentPositionMs === 'number'
+      ? `${formatDuration(currentPositionMs)} / ${formatDuration(currentTrack.durationMs)}`
+      : formatDuration(currentTrack.durationMs, currentTrack.isStream)
+    : '';
+
   const currentLine = currentTrack
-    ? `**Tocando agora${paused ? ' (Pausada)' : ''}:** ${formatTrackLink(currentTrack.title, currentTrack.uri)} — \`${formatDuration(currentTrack.durationMs, currentTrack.isStream)}\``
+    ? `**Tocando agora${paused ? ' (Pausada)' : ''}:** ${formatTrackLink(currentTrack.title, currentTrack.uri)} — \`${currentDurationLabel}\``
     : '**Tocando agora:** Nenhuma música tocando no momento.';
 
   const upcomingLines =
@@ -278,7 +401,11 @@ export function buildQueueEmbed(options: QueueEmbedOptions): EmbedBuilder {
           .map((track, idx) => {
             const position = paginated.startIndex + idx + 1;
             const duration = formatDuration(track.durationMs, track.isStream);
-            return `**${position}.** ${formatTrackLink(track.title, track.uri)} — \`${duration}\``;
+            const requesterSuffix =
+              track.requesterId || track.requesterTag
+                ? ` — ${formatRequester(track.requesterId, track.requesterTag)}`
+                : '';
+            return `**${position}.** ${formatTrackLink(track.title, track.uri)} — \`${duration}\`${requesterSuffix}`;
           })
           .join('\n')
       : 'A fila está vazia.';
@@ -340,6 +467,48 @@ export function buildQueuePaginationButtons(
 }
 
 /**
+ * Builds the 4-button smart queue management row (`Atualizar`, `Embaralhar`, `Sem Duplicadas`, `Limpar`).
+ */
+export function buildQueueActionButtons(options: {
+  hasTracks: boolean;
+  disabled?: boolean;
+}): ActionRowBuilder<ButtonBuilder> {
+  const disabled = Boolean(options.disabled);
+  const trackActionsDisabled = disabled || !options.hasTracks;
+
+  const refreshButton = new ButtonBuilder()
+    .setCustomId(QUEUE_ACTION_IDS.refresh)
+    .setLabel('🔄 Atualizar')
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(disabled);
+
+  const shuffleButton = new ButtonBuilder()
+    .setCustomId(QUEUE_ACTION_IDS.shuffle)
+    .setLabel('🔀 Embaralhar')
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(trackActionsDisabled);
+
+  const dedupeButton = new ButtonBuilder()
+    .setCustomId(QUEUE_ACTION_IDS.dedupe)
+    .setLabel('🧹 Sem Duplicadas')
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(trackActionsDisabled);
+
+  const clearButton = new ButtonBuilder()
+    .setCustomId(QUEUE_ACTION_IDS.clear)
+    .setLabel('🗑️ Limpar')
+    .setStyle(ButtonStyle.Danger)
+    .setDisabled(trackActionsDisabled);
+
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    refreshButton,
+    shuffleButton,
+    dedupeButton,
+    clearButton,
+  );
+}
+
+/**
  * Disables all button components on an arbitrary Discord message, swallowing expected
  * `Unknown Message` (`10008`) / `Missing Access` (`50001`) errors silently.
  */
@@ -388,6 +557,45 @@ export class PanelTracker {
    */
   clearPanel(guildId: string): void {
     this.panels.delete(guildId);
+  }
+
+  /**
+   * Fetches and updates the tracked panel message for `guildId`, removing stale refs on ignorable Discord errors.
+   * Returns `true` when the panel remains active (updated or hit a transient error) and `false` when gone/inaccessible.
+   */
+  async updatePanelSafely(
+    guildId: string,
+    fetcher: PanelMessageFetcher,
+    payload: {
+      embeds?: EmbedBuilder[];
+      components?: ActionRowBuilder<ButtonBuilder>[];
+    },
+  ): Promise<boolean> {
+    const ref = this.panels.get(guildId);
+    if (!ref) {
+      return false;
+    }
+
+    try {
+      const message = await fetcher(ref);
+      if (!message) {
+        if (this.panels.get(guildId) === ref) {
+          this.panels.delete(guildId);
+        }
+        return false;
+      }
+      await message.edit(payload);
+      return true;
+    } catch (error) {
+      if (isIgnorableDiscordPanelError(error)) {
+        if (this.panels.get(guildId) === ref) {
+          this.panels.delete(guildId);
+        }
+        return false;
+      }
+      this.onUnexpectedError?.(error);
+      return true;
+    }
   }
 
   /**
