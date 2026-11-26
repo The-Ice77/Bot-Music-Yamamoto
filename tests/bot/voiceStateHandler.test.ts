@@ -370,6 +370,7 @@ test('main logs safe startup validation errors to stderr without leaking secrets
       env: {
         PATH: process.env.PATH ?? '',
         SystemRoot: process.env.SystemRoot ?? '',
+        DOTENV_CONFIG_PATH: path.join(worktreeRoot, '.env.nonexistent-test'),
         LAVALINK_PASSWORD: 'secret-direct-run-password',
       },
       encoding: 'utf8',

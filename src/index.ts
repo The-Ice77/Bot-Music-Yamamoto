@@ -11,6 +11,169 @@ import { createLogger, type AppLogger } from './utils/logger.js';
 
 const EMBEDDED_LAVALINK_DIR = '/opt/Lavalink';
 const EMBEDDED_LAVALINK_JAR = '/opt/Lavalink/Lavalink.jar';
+const LAVALINK_READY_TIMEOUT_MS = 120_000;
+const LAVALINK_PROBE_INTERVAL_MS = 2_000;
+const LAVALINK_RESTART_DELAY_MS = 5_000;
+
+const LAVALINK_ERROR_PATTERN = /ERROR|Exception|OutOfMemory/;
+const LAVALINK_INFO_PATTERN = /Lavalink is ready|Started Launcher|WARN|Found plugin|Loaded '/;
+
+function attachLineLogger(
+  stream: NodeJS.ReadableStream | null,
+  onLine: (line: string) => void,
+): void {
+  if (!stream) {
+    return;
+  }
+  let remainder = '';
+  stream.on('data', (chunk: Buffer | string) => {
+    remainder += chunk.toString();
+    const lines = remainder.split(/\r?\n/);
+    remainder = lines.pop() ?? '';
+    for (const rawLine of lines) {
+      const trimmed = rawLine.trim();
+      if (trimmed) {
+        onLine(trimmed);
+      }
+    }
+  });
+  stream.on('end', () => {
+    const trimmed = remainder.trim();
+    remainder = '';
+    if (trimmed) {
+      onLine(trimmed);
+    }
+  });
+}
+
+function logLavalinkStdoutLine(line: string, logger: AppLogger): void {
+  if (LAVALINK_ERROR_PATTERN.test(line)) {
+    logger.error({ lavalink: line }, 'Lavalink error');
+    return;
+  }
+  if (LAVALINK_INFO_PATTERN.test(line)) {
+    if (line.includes('WARN')) {
+      logger.warn({ lavalink: line }, 'Lavalink warn');
+      return;
+    }
+    logger.info({ lavalink: line }, 'Lavalink stdout');
+    return;
+  }
+  logger.debug({ lavalink: line }, 'Lavalink stdout');
+}
+
+function probeLavalinkVersion(port: number, password: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = http.get(
+      {
+        hostname: '127.0.0.1',
+        port,
+        path: '/version',
+        headers: { Authorization: password },
+        timeout: 1500,
+      },
+      (res) => {
+        res.resume();
+        resolve(res.statusCode ?? 0);
+      },
+    );
+    req.on('timeout', () => {
+      req.destroy(new Error('Tempo esgotado ao consultar /version do Lavalink'));
+    });
+    req.on('error', reject);
+  });
+}
+
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal?.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener('abort', finish, { once: true });
+  });
+}
+
+async function waitForLavalinkReady(
+  env: EnvConfig,
+  child: ChildProcess,
+  logger: AppLogger,
+  timeoutMs = LAVALINK_READY_TIMEOUT_MS,
+  shutdownSignal?: AbortSignal,
+): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null || shutdownSignal?.aborted) {
+    return false;
+  }
+
+  const waitAbort = new AbortController();
+  let exitedEarly = false;
+
+  const handleEarlyStop = () => {
+    exitedEarly = true;
+    waitAbort.abort();
+  };
+  const handleShutdownAbort = () => {
+    waitAbort.abort();
+  };
+
+  child.once('exit', handleEarlyStop);
+  child.once('error', handleEarlyStop);
+  shutdownSignal?.addEventListener('abort', handleShutdownAbort, { once: true });
+
+  const deadline = Date.now() + timeoutMs;
+  logger.info(
+    { port: env.LAVALINK_PORT, timeoutMs },
+    'Aguardando Lavalink embutido ficar pronto antes de conectar o bot...',
+  );
+
+  try {
+    while (!exitedEarly && !waitAbort.signal.aborted) {
+      try {
+        const status = await probeLavalinkVersion(env.LAVALINK_PORT, env.LAVALINK_PASSWORD);
+        if (status === 200) {
+          logger.info(
+            { port: env.LAVALINK_PORT },
+            'Lavalink embutido respondeu /version (200 OK); iniciando cliente Discord...',
+          );
+          return true;
+        }
+      } catch {
+        // Lavalink ainda está iniciando; aguarda o próximo ciclo de verificação.
+      }
+
+      if (exitedEarly || waitAbort.signal.aborted) {
+        break;
+      }
+
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        break;
+      }
+
+      await sleepAbortable(Math.min(LAVALINK_PROBE_INTERVAL_MS, remaining), waitAbort.signal);
+    }
+  } finally {
+    child.removeListener('exit', handleEarlyStop);
+    child.removeListener('error', handleEarlyStop);
+    shutdownSignal?.removeEventListener('abort', handleShutdownAbort);
+  }
+
+  if (exitedEarly) {
+    logger.warn('Processo Lavalink embutido encerrou antes de ficar pronto');
+  } else if (!shutdownSignal?.aborted) {
+    logger.warn(
+      { port: env.LAVALINK_PORT, timeoutMs },
+      'Tempo limite atingido aguardando Lavalink embutido; iniciando bot com reconexão automática',
+    );
+  }
+
+  return false;
+}
 
 function startCloudHealthServer(logger: AppLogger): http.Server | null {
   const rawPort = process.env.PORT?.trim();
@@ -34,7 +197,11 @@ function startCloudHealthServer(logger: AppLogger): http.Server | null {
   return server;
 }
 
-function startEmbeddedLavalinkIfPresent(env: EnvConfig, logger: AppLogger): ChildProcess | null {
+function startEmbeddedLavalinkIfPresent(
+  env: EnvConfig,
+  logger: AppLogger,
+  onUnexpectedExit?: () => void,
+): ChildProcess | null {
   const isLocalHost =
     env.LAVALINK_HOST === '127.0.0.1' || env.LAVALINK_HOST.toLowerCase() === 'localhost';
   if (!isLocalHost || !fs.existsSync(EMBEDDED_LAVALINK_JAR)) {
@@ -42,35 +209,45 @@ function startEmbeddedLavalinkIfPresent(env: EnvConfig, logger: AppLogger): Chil
   }
 
   logger.info('Iniciando Lavalink v4.2.2 embutido no mesmo container...');
+  const childEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    LAVALINK_SERVER_PASSWORD: env.LAVALINK_PASSWORD,
+  };
+  delete childEnv.PORT;
+
   const child = spawn(
     'java',
-    ['-Xms64M', '-Xmx220M', '-XX:+UseSerialGC', '-jar', EMBEDDED_LAVALINK_JAR],
+    [
+      '-Xms64M',
+      '-Xmx256M',
+      '-XX:+UseSerialGC',
+      `-Dserver.port=${env.LAVALINK_PORT}`,
+      '-Dserver.address=127.0.0.1',
+      '-jar',
+      EMBEDDED_LAVALINK_JAR,
+    ],
     {
       cwd: EMBEDDED_LAVALINK_DIR,
-      env: {
-        ...process.env,
-        LAVALINK_SERVER_PASSWORD: env.LAVALINK_PASSWORD,
-      },
+      env: childEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
     },
   );
 
-  child.stdout?.on('data', (chunk: Buffer) => {
-    const line = chunk.toString().trim();
-    if (line) {
-      logger.debug({ lavalink: line }, 'Lavalink stdout');
-    }
+  attachLineLogger(child.stdout, (line) => {
+    logLavalinkStdoutLine(line, logger);
   });
 
-  child.stderr?.on('data', (chunk: Buffer) => {
-    const line = chunk.toString().trim();
-    if (line) {
-      logger.warn({ lavalink: line }, 'Lavalink stderr');
-    }
+  attachLineLogger(child.stderr, (line) => {
+    logger.warn({ lavalink: line }, 'Lavalink stderr');
+  });
+
+  child.on('error', (error) => {
+    logger.error({ err: error }, 'Erro no processo Lavalink embutido');
   });
 
   child.on('exit', (code, signal) => {
     logger.warn({ code, signal }, 'Processo Lavalink embutido encerrado');
+    onUnexpectedExit?.();
   });
 
   return child;
@@ -133,10 +310,39 @@ export async function main(deps: MainDeps = {}): Promise<BotRuntime> {
 
   const logger: AppLogger = buildLogger(env.LOG_LEVEL);
   const healthServer = startCloudHealthServer(logger);
-  const embeddedLavalink = startEmbeddedLavalinkIfPresent(env, logger);
+
+  let shuttingDown = false;
+  let lavalinkRespawnTimer: NodeJS.Timeout | null = null;
+  let embeddedLavalink: ChildProcess | null = null;
+  const startupAbort = new AbortController();
+
+  const scheduleLavalinkRespawn = () => {
+    if (shuttingDown || lavalinkRespawnTimer !== null) {
+      return;
+    }
+    logger.warn(
+      { delayMs: LAVALINK_RESTART_DELAY_MS },
+      'Lavalink embutido caiu; reiniciando automaticamente...',
+    );
+    lavalinkRespawnTimer = setTimeout(() => {
+      lavalinkRespawnTimer = null;
+      if (shuttingDown) {
+        return;
+      }
+      embeddedLavalink = startEmbeddedLavalinkIfPresent(env, logger, scheduleLavalinkRespawn);
+    }, LAVALINK_RESTART_DELAY_MS);
+  };
+
+  embeddedLavalink = startEmbeddedLavalinkIfPresent(env, logger, scheduleLavalinkRespawn);
   const bot = buildBot(env, { logger });
 
   const cleanupExtras = () => {
+    shuttingDown = true;
+    startupAbort.abort();
+    if (lavalinkRespawnTimer !== null) {
+      clearTimeout(lavalinkRespawnTimer);
+      lavalinkRespawnTimer = null;
+    }
     if (healthServer) {
       healthServer.close();
     }
@@ -170,6 +376,18 @@ export async function main(deps: MainDeps = {}): Promise<BotRuntime> {
   });
 
   try {
+    if (embeddedLavalink) {
+      await waitForLavalinkReady(
+        env,
+        embeddedLavalink,
+        logger,
+        LAVALINK_READY_TIMEOUT_MS,
+        startupAbort.signal,
+      );
+    }
+    if (shuttingDown) {
+      return bot;
+    }
     await bot.start();
     return bot;
   } catch (error) {
